@@ -5,9 +5,9 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/${PROJECT_ID}/tunnel:${SHORT_SHA}'
+      - 'gcr.io/${PROJECT_ID}/web-terminal:${SHORT_SHA}'
       - '--label=git-version=${SHORT_SHA}'
       - '.'
 
 images:
-  - 'gcr.io/${PROJECT_ID}/tunnel:${SHORT_SHA}'
+  - 'gcr.io/${PROJECT_ID}/web-terminal:${SHORT_SHA}'
