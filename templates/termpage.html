@@ -46,13 +46,6 @@
           console.log('copy succeeded', copySucceeded);
           return false;
         }
-        if (e.ctrlKey && e.shiftKey && e.keyCode == 86) {
-          navigator.clipboard.readText().then(text => {
-            console.log(text)
-            term.paste(text);
-          })
-          return false;
-        }
       });
 
      
