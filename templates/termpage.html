@@ -5,11 +5,18 @@
   <title>ssh</title>
 
 <style>
-    html {
-      background: rgb(0, 0, 0);
-    }
     h1 {
       font: 30px/1.5 sans-serif;
+    }
+    html,
+    body {
+        background: rgb(0, 0, 0);
+        height: 99%;
+        width:  99%;
+    }
+    ::-webkit-scrollbar {
+      width: 0px;
+      background: transparent; /* make scrollbar transparent */
     }
   </style>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@4.17.0/css/xterm.css" />
@@ -19,29 +26,18 @@
   <script>
   
     window.onload=function() {
-      // Test size: 25x80
-      var termRowHeight=0.0+1.00*document.getElementById("dummy-screen").offsetHeight/25;
-      var termColWidth=0.0+(1.02*document.getElementById("dummy-screen-rows").offsetWidth/80);
-      document.getElementById("dummy-screen").setAttribute("style","display: none");
-      
 
       var protocol=(window.location.protocol.indexOf("https")===0)? "wss":"ws";
       var ws_url=protocol+"://"+window.location.host + window.location.pathname + "{{ws_url_path}}";
 
-      function calculate_size(element) {
-        var rows=Math.max(2,Math.floor(element.innerHeight/termRowHeight)-1);
-        var cols=Math.max(3,Math.floor(element.innerWidth/termColWidth)-1);
-        console.log("resize:",termRowHeight,termColWidth,element.innerHeight,
-          element.innerWidth,rows,cols);
-        return {rows: rows,cols: cols};
-      }
+      var term = new Terminal();
 
-      size=calculate_size(window);
-
-      var term = new Terminal({cols: size.cols, rows: size.rows});
-
-      // term.loadAddon(new FitAddon.FitAddon());
+      var fitAddon = new FitAddon.FitAddon()
+      term.loadAddon(fitAddon);
       term.loadAddon(new WebLinksAddon.WebLinksAddon());
+      
+      term.open(document.body);
+      fitAddon.fit();
 
       term.attachCustomKeyEventHandler(function (e) {
         // Ctrl + Shift + C
@@ -51,8 +47,6 @@
           return false;
         }
         if (e.ctrlKey && e.shiftKey && e.keyCode == 86) {
-          // var pasteSucceeded = document.execCommand('paste');
-          // console.log('paste succeeded', pasteSucceeded);
           navigator.clipboard.readText().then(text => {
             console.log(text)
             term.paste(text);
@@ -61,14 +55,13 @@
         }
       });
 
-      term.open(document.body);
+     
       var disposable = null;
-      function make_reconneting_terminal(size,ws_url) {
+      function make_reconneting_terminal(ws_url) {
         var ws = new WebSocket(ws_url);
 
         ws.onopen=function(event) {
-          ws.send(JSON.stringify(["set_size",size.rows,size.cols,
-            window.innerHeight,window.innerWidth]));
+
           disposable = term.onData((data) => {
             ws.send(JSON.stringify(['stdin',data]));
           });
@@ -94,49 +87,19 @@
           if(disposable) {
             disposable.dispose()
           }
-          setTimeout(make_reconneting_terminal(size,ws_url),500);
+          setTimeout(make_reconneting_terminal(ws_url),500);
         };
         return {socket: ws,term: term};
       }
 
-      var terminal = make_reconneting_terminal(size, ws_url);
+      make_reconneting_terminal(ws_url);
       window.onresize=function() {
-        var geom=calculate_size(window);
-        terminal.term.resize(geom.cols,geom.rows);
-        terminal.socket.send(JSON.stringify(["set_size",geom.rows,geom.cols,
-          window.innerHeight,window.innerWidth]));
+        fitAddon.fit()
       };
     };
   </script>
 </head>
 
 <body>
-  <!-- test size: 25x80 -->
-  <pre id="dummy-screen"
-    style="visibility:hidden; border: white solid 5px; font-family: &quot;DejaVu Sans Mono&quot;, &quot;Liberation Mono&quot;, monospace; font-size: 11px;">0
-1
-2
-3
-4
-5
-6
-7
-8
-9
-0
-1
-2
-3
-4
-5
-6
-7
-8
-9
-0
-1
-2
-3
-<span id="dummy-screen-rows" style="visibility:hidden;">01234567890123456789012345678901234567890123456789012345678901234567890123456789</span>
-</pre>
+
 </body>
