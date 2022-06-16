@@ -89,7 +89,7 @@ def main():
                               xstatic_url=tornado_xstatic.url_maker('/xstatic/'),
                               term_manager=term_manager)
 
-    application.listen(8080, 'localhost')
+    application.listen(8080)
     loop = tornado.ioloop.IOLoop.instance()
     try:
         loop.start()
