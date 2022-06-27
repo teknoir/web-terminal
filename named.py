@@ -3,11 +3,13 @@
 Plus a /new URL which will create a new terminal and redirect to it.
 """
 from __future__ import print_function, absolute_import
+import json
 import logging
 import os.path
 import sys
 import datetime
 import logging as log
+import time
 
 import tornado.web
 # This demo requires tornado_xstatic and XStatic-term.js
@@ -15,13 +17,24 @@ import tornado_xstatic
 from tornado.ioloop import IOLoop, PeriodicCallback
 
 from terminado import TermSocket, NamedTermManager
-from common_demo_stuff import run_and_show_browser, STATIC_DIR, TEMPLATE_DIR
+from common_demo_stuff import run_and_show_browser, TEMPLATE_DIR
 
 AUTH_TYPES = ("none", "login")
 logging.basicConfig(level=logging.INFO)
 
+last_used_time = None
+
+class ActivityHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_header("Content-Type", 'application/json')
+        r = json.dumps({'last_used_time': last_used_time})
+        self.write(r)
+
+
 class TerminalSocket(TermSocket):
     def on_message(self, message):
+        global last_used_time
+        last_used_time = int(time.time())
         super().on_message(message)
         if self.term_name in self.term_manager.terminals:
             self.term_manager.terminals[self.term_name].last_activity = datetime.datetime.now()
@@ -77,6 +90,8 @@ def main():
     culler.start()
 
     handlers = [
+                (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": 'static'}),
+                (r"/activity", ActivityHandler, {}),
                 (r"/(\w+)/websocket", TerminalSocket,
                      {'term_manager': term_manager}),
                 (r"/new/?", NewTerminalHandler),
@@ -84,7 +99,7 @@ def main():
                 (r"/(\w+)/?", TerminalPageHandler),
                 (r"/xstatic/(.*)", tornado_xstatic.XStaticFileHandler)
                ]
-    application = tornado.web.Application(handlers, static_path=STATIC_DIR,
+    application = tornado.web.Application(handlers,
                               template_path=TEMPLATE_DIR,
                               xstatic_url=tornado_xstatic.url_maker('/xstatic/'),
                               term_manager=term_manager)
