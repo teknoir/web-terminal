@@ -5,6 +5,11 @@
   <title>ssh</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
 <style>
+    @font-face {
+        font-family: 'MesloLGS NF';
+        src: url('https://cdn.jsdelivr.net/gh/romkatv/powerlevel10k-media@master/MesloLGS%20NF%20Regular.ttf') format('truetype');
+    }
+
     h1 {
       font: 30px/1.5 sans-serif;
     }
@@ -16,6 +21,8 @@
         height: 100%;
         width: 100%;
         overflow: hidden;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
     }
     ::-webkit-scrollbar {
       width: 0px;
@@ -40,7 +47,10 @@
       }
       var ws_url = protocol + "://" + window.location.host + path + ws_endpoint;
 
-      var term = new Terminal();
+      var term = new Terminal({
+        fontFamily: '"MesloLGS NF", "DejaVu Sans Mono", "Liberation Mono", monospace',
+        fontSize: 14,
+      });
       var fitAddon = new FitAddon.FitAddon();
       term.loadAddon(fitAddon);
       term.loadAddon(new WebLinksAddon.WebLinksAddon());

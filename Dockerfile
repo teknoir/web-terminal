@@ -10,6 +10,8 @@ WORKDIR /app
 # Install system dependencies
 RUN apk add --no-cache \
     bash \
+    zsh \
+    git \
     tini \
     openssh-client \
     libwebsockets
