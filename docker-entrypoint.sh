@@ -18,5 +18,5 @@ export REMOTE_ACCESS_PORT=${2:-${REMOTE_ACCESS_PORT:-49322}}
 export PORT=${PORT:-8080}
 export WEB_TERMINAL_SCRIPT_FILE=${3:-${WEB_TERMINAL_SCRIPT_FILE:-"/app/app/named.py"}}
 
-export PROXY_CMD="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i ${RSA_KEY_FILE} -N -W %h:%p ${DEADENDUSER}@${DEADENDHOST} -p ${DEADENDPORT}"
+export PROXY_CMD="ssh -o LogLevel=ERROR -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i ${RSA_KEY_FILE} -N -W %h:%p ${DEADENDUSER}@${DEADENDHOST} -p ${DEADENDPORT}"
 exec python3 ${WEB_TERMINAL_SCRIPT_FILE}

@@ -31,7 +31,23 @@ class TerminalPageHandler(tornado.web.RequestHandler):
                            ws_url_path="/websocket")
 
 def main():
-    term_manager = SingleTermManager(shell_command=['bash'])
+    proxy_cmd = os.environ.get('PROXY_CMD')
+    rsa_key_file = os.environ.get('RSA_KEY_FILE', '/priv.pem')
+    remote_username = os.environ.get('REMOTE_USERNAME', 'teknoir')
+    remote_access_port = os.environ.get('REMOTE_ACCESS_PORT', '49322')
+    shell_command = [
+        'ssh',
+        '-o', 'LogLevel=ERROR',
+        '-o', f'ProxyCommand={proxy_cmd}',
+        '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'ServerAliveInterval=60',
+        '-i', rsa_key_file,
+        f"{remote_username}@127.0.0.1",
+        '-p', remote_access_port
+    ]
+
+    term_manager = SingleTermManager(shell_command=shell_command)
     handlers = [
         (r"/websocket", ExtendedTermSocket, {'term_manager': term_manager}),
         (r"/activity", ActivityHandler),

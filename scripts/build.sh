@@ -4,7 +4,7 @@ set -euo pipefail
 # Default values
 PROJECT_ID=${PROJECT_ID:-"teknoir"}
 TAG=${TAG:-$(date +%Y%m%d-%H%M%S)}
-IMAGE_NAME="us-central1-docker.pkg.dev/${PROJECT_ID}/web-terminal:${TAG}"
+IMAGE_NAME="gcr.io/${PROJECT_ID}/web-terminal:${TAG}"
 
 echo "Building Docker image: ${IMAGE_NAME}..."
 

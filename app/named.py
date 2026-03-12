@@ -67,6 +67,7 @@ def main():
     remote_access_port = os.environ.get('REMOTE_ACCESS_PORT', '49322')
     shell_command = [
         'ssh',
+        '-o', 'LogLevel=ERROR',
         '-o', f'ProxyCommand={proxy_cmd}',
         '-o', 'UserKnownHostsFile=/dev/null',
         '-o', 'StrictHostKeyChecking=no',
