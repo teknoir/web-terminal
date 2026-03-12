@@ -1,13 +1,29 @@
-FROM python:3.6-alpine3.14
-COPY ./ /app
+FROM python:3.11-alpine
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TERM=xterm-256color
+
 WORKDIR /app
 
-RUN apk add --no-cache bash tini openssh-client libwebsockets\
-    && pip3 install -r requirements.txt
- 
-RUN apk add --no-cache -X http://dl-cdn.alpinelinux.org/alpine/edge/testing \
-      corkscrew && \
-      rm -rf /var/cache/apk/*
+# Install system dependencies
+RUN apk add --no-cache \
+    bash \
+    tini \
+    openssh-client \
+    libwebsockets
 
-ADD docker-entrypoint.sh /usr/bin
-ENTRYPOINT ["docker-entrypoint.sh"]
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the application source
+COPY app/ app/
+COPY docker-entrypoint.sh .
+
+# Prepare entrypoint script
+RUN chmod +x docker-entrypoint.sh && \
+    cp docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["/sbin/tini", "--", "docker-entrypoint.sh"]

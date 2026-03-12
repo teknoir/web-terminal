@@ -1,6 +1,0 @@
-Host *
-    ProxyCommand corkscrew deadendproxy.deadend-system.svc.cluster.local 8118 %h %p
-    ServerAliveInterval 60
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-    LogLevel ERROR

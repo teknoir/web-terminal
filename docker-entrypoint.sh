@@ -1,14 +1,22 @@
 #!/bin/sh
-set -xe
+set -e
 
-# Due to: https://github.com/kubernetes/kubernetes/issues/57923 and https://github.com/istio/istio/issues/26882
-# we need this workaround:
-cp /cert/priv.pem /
-chmod 600 /priv.pem
+# Workaround for K8s/Istio issues with mounting certs
+# See: https://github.com/kubernetes/kubernetes/issues/57923
+if [ -f /cert/priv.pem ]; then
+    cp /cert/priv.pem /priv.pem
+    chmod 600 /priv.pem
+fi
+export RSA_KEY_FILE=${RSA_KEY_FILE:-"/priv.pem"}
 
-export TEKNOIR_USER=${1:-teknoir}
-export DEVICE_PORT=${2:-49322}
-export TERM=xterm-256color
+export DEADENDUSER=${DEADENDUSER:-"teknoir"}
+export DEADENDHOST=${DEADENDHOST:-"deadend"}
+export DEADENDPORT=${DEADENDPORT:-2222}
 
+export REMOTE_USERNAME=${1:-${REMOTE_USERNAME:-"teknoir"}}
+export REMOTE_ACCESS_PORT=${2:-${REMOTE_ACCESS_PORT:-49322}}
+export PORT=${PORT:-8080}
+export WEB_TERMINAL_SCRIPT_FILE=${3:-${WEB_TERMINAL_SCRIPT_FILE:-"/app/app/named.py"}}
 
-python3 /app/named.py 
+export PROXY_CMD="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i ${RSA_KEY_FILE} -N -W %h:%p ${DEADENDUSER}@${DEADENDHOST} -p ${DEADENDPORT}"
+exec python3 ${WEB_TERMINAL_SCRIPT_FILE}

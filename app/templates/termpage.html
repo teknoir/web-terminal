@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+
+<head>
+  <meta charset="UTF-8">
+  <title>ssh</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<style>
+    h1 {
+      font: 30px/1.5 sans-serif;
+    }
+    html,
+    body {
+        background: rgb(0, 0, 0);
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+        overflow: hidden;
+    }
+    ::-webkit-scrollbar {
+      width: 0px;
+      background: transparent; /* make scrollbar transparent */
+    }
+  </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@4.17.0/css/xterm.css" />
+	<script src="https://cdn.jsdelivr.net/npm/xterm@4.17.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.5.0/lib/xterm-addon-fit.js"></script> 
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.5.1/lib/xterm-addon-web-links.min.js"></script> 
+  <script>
+  
+    window.onload = function() {
+      var protocol = (window.location.protocol.indexOf("https") === 0) ? "wss" : "ws";
+      var path = window.location.pathname;
+      if (!path.endsWith('/')) {
+        path += '/';
+      }
+      var ws_endpoint = "{{ws_url_path}}";
+      if (ws_endpoint.startsWith('/')) {
+        ws_endpoint = ws_endpoint.substring(1);
+      }
+      var ws_url = protocol + "://" + window.location.host + path + ws_endpoint;
+
+      var term = new Terminal();
+      var fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.loadAddon(new WebLinksAddon.WebLinksAddon());
+
+      term.open(document.body);
+      fitAddon.fit();
+
+      var ws;
+
+      term.onResize((size) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(['set_size', size.rows, size.cols]));
+        }
+      });
+
+      term.attachCustomKeyEventHandler(function (e) {
+        // Ctrl + Shift + C
+        if (e.ctrlKey && e.shiftKey && (e.keyCode == 3)) {
+          document.execCommand('copy');
+          return false;
+        }
+      });
+
+      var data_disposable = null;
+      var title_disposable = null;
+
+      function make_reconnecting_terminal(ws_url) {
+        ws = new WebSocket(ws_url);
+
+        ws.onopen = function(event) {
+          // Send initial size
+          ws.send(JSON.stringify(['set_size', term.rows, term.cols]));
+
+          data_disposable = term.onData((data) => {
+            ws.send(JSON.stringify(['stdin', data]));
+          });
+
+          title_disposable = term.onTitleChange((title) => {
+            document.title = title;
+          });
+
+          ws.onmessage = function(event) {
+            var json_msg = JSON.parse(event.data);
+            switch (json_msg[0]) {
+              case "stdout":
+                term.write(json_msg[1]);
+                break;
+              case "disconnect":
+                term.write("\r\n\r\n[Session was closed (maybe due to inactivity)]\r\n");
+                break;
+            }
+          };
+        };
+
+        ws.onclose = function(event) {
+          console.log('WebSocket closed');
+          if (data_disposable) data_disposable.dispose();
+          if (title_disposable) title_disposable.dispose();
+          setTimeout(function() {
+            make_reconnecting_terminal(ws_url);
+          }, 500);
+        };
+      }
+
+      make_reconnecting_terminal(ws_url);
+
+      window.onresize = function() {
+        fitAddon.fit();
+      };
+    };
+  </script>
+</head>
+
+<body>
+
+</body>

@@ -1,6 +1,2 @@
 terminado
 tornado
-tornado-xstatic
-XStatic
-XStatic-term.js
-traitlets
