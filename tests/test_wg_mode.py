@@ -27,7 +27,7 @@ class FakeConfig(wg_mode.WireGuardConfig):
 
 
 def make_config(cls=wg_mode.WireGuardConfig):
-    return cls(hub_url='http://wg-hub.teknoir-ztna.svc:8080', namespace='teknoir-demo',
+    return cls(hub_url='http://wg-hub.teknoir-ztna.svc:8081', namespace='teknoir-demo',
                device='cam-1', sa_token_file='/var/run/secrets/ztna/token',
                remote_username='teknoir', rsa_key_file='/priv.pem')
 
@@ -236,7 +236,7 @@ class TestCommand(AsyncHTTPTestCase):
         cfg = make_config()
         kh = '/tmp/wgterm-x/known_hosts'
         argv = cfg.build_command(ALICE, kh)
-        proxy = ("wg-connect --hub-url http://wg-hub.teknoir-ztna.svc:8080 --namespace teknoir-demo "
+        proxy = ("wg-connect --hub-url http://wg-hub.teknoir-ztna.svc:8081 --namespace teknoir-demo "
                  "--device cam-1 --port 22 --direct --sa-token-file /var/run/secrets/ztna/token "
                  "--on-behalf-of alice@example.com --known-hosts-file " + kh)
         self.assertEqual(argv, [
@@ -267,7 +267,7 @@ class TestCommand(AsyncHTTPTestCase):
                 cfg.build_command(bad, '/tmp/k')
 
     def test_config_validation(self):
-        base = dict(hub_url='http://h:8080', namespace='ns', device='d',
+        base = dict(hub_url='http://h:8081', namespace='ns', device='d',
                     sa_token_file='/t', remote_username='teknoir', rsa_key_file='/k')
         wg_mode.WireGuardConfig(**base)
         for key, bad in (('hub_url', 'http://h; id'), ('hub_url', ''), ('namespace', 'NS x'),
@@ -278,7 +278,7 @@ class TestCommand(AsyncHTTPTestCase):
 
     def test_from_env(self):
         cfg = wg_mode.WireGuardConfig.from_env({
-            'WG_HUB_URL': 'http://wg-hub:8080', 'WG_NAMESPACE': 'ns', 'WG_DEVICE': 'd',
+            'WG_HUB_URL': 'http://wg-hub:8081', 'WG_NAMESPACE': 'ns', 'WG_DEVICE': 'd',
             'WG_SA_TOKEN_FILE': '/t'})
         self.assertEqual((cfg.remote_username, cfg.rsa_key_file), ('teknoir', '/priv.pem'))
         with self.assertRaises(wg_mode.ConfigError):
