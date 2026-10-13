@@ -3,9 +3,21 @@ set -e
 
 # Workaround for K8s/Istio issues with mounting certs
 # See: https://github.com/kubernetes/kubernetes/issues/57923
-if [ -f /cert/priv.pem ]; then
-    cp /cert/priv.pem /priv.pem
-    chmod 600 /priv.pem
+if [ "${SSH_PROXY_MODE:-deadend}" = "wireguard" ]; then
+    # Non-root + readOnlyRootFilesystem: the key copy lives in the writable TMPDIR
+    # (an emptyDir in the pod), mode 0600, owned by the running user.
+    export TMPDIR=${TMPDIR:-/tmp}
+    export PYTHONDONTWRITEBYTECODE=1
+    if [ -f /cert/priv.pem ]; then
+        (umask 077; cp /cert/priv.pem "${TMPDIR}/priv.pem")
+        chmod 600 "${TMPDIR}/priv.pem"
+        export RSA_KEY_FILE="${TMPDIR}/priv.pem"
+    fi
+else
+    if [ -f /cert/priv.pem ]; then
+        cp /cert/priv.pem /priv.pem
+        chmod 600 /priv.pem
+    fi
 fi
 export RSA_KEY_FILE=${RSA_KEY_FILE:-"/priv.pem"}
 

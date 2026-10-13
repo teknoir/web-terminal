@@ -1,8 +1,7 @@
 # wg-connect: the ProxyCommand used by SSH_PROXY_MODE=wireguard.
-# NOTE: cmd/wg-connect lands in github.com/teknoir/wg-tunnel with work package A3;
-# until then this stage (and so the image build) fails. Pin WG_TUNNEL_REF to a tag or sha for releases.
-FROM golang:1.25-alpine AS wg
-ARG WG_TUNNEL_REF=main
+# WG_TUNNEL_REF is pinned to a wg-tunnel main commit sha; bump it for releases.
+FROM golang:1.26-alpine AS wg
+ARG WG_TUNNEL_REF=4156b36f4d99e2e14ef8171d5b323d23dec134b4
 RUN CGO_ENABLED=0 GOBIN=/out go install -trimpath github.com/teknoir/wg-tunnel/cmd/wg-connect@${WG_TUNNEL_REF}
 
 FROM python:3.11-alpine
