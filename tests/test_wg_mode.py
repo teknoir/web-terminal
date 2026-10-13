@@ -45,6 +45,8 @@ class WGTestBase(AsyncHTTPTestCase):
 
     def fetch_as(self, path, email=None, **kw):
         headers = kw.pop('headers', {})
+        if kw.pop('same_site', True):
+            headers.setdefault('Sec-Fetch-Site', 'none')
         if email is not None:
             headers[HDR] = email
         return self.fetch(path, headers=headers, follow_redirects=False, **kw)
@@ -63,6 +65,30 @@ class WGTestBase(AsyncHTTPTestCase):
 
 
 class TestAccess(WGTestBase):
+    def test_csrf_cross_site_refused_and_creates_nothing(self):
+        for path in ('/', '/new'):
+            for site in ('cross-site', 'same-site', ''):
+                resp = self.fetch_as(path, ALICE, headers={'Sec-Fetch-Site': site})
+                self.assertEqual(resp.code, 403, (path, site))
+        self.assertEqual(self.manager.terminals, {})
+
+    def test_csrf_fetch_site_allowed(self):
+        for site in ('same-origin', 'none'):
+            resp = self.fetch_as('/new', ALICE, headers={'Sec-Fetch-Site': site})
+            self.assertEqual(resp.code, 302, site)
+
+    def test_csrf_without_fetch_metadata_needs_matching_origin(self):
+        host = '127.0.0.1:%d' % self.get_http_port()
+        def go(**h):
+            return self.fetch_as('/new', ALICE, same_site=False, headers=dict(h, Host=host))
+        self.assertEqual(go().code, 403)
+        self.assertEqual(go(Referer='https://evil.example/x').code, 403)
+        self.assertEqual(go(Origin='https://evil.example').code, 403)
+        self.assertEqual(go(Referer='https://' + host + '.evil.example/').code, 403)
+        self.assertEqual(go(Referer='http://' + host + '/page').code, 302)
+        self.assertEqual(go(Origin='http://' + host).code, 302)
+        self.assertEqual(self.manager.terminals.__len__(), 2)
+
     def test_missing_email_is_403(self):
         for path in ('/', '/new'):
             self.assertEqual(self.fetch_as(path).code, 403)

@@ -22,6 +22,7 @@ import shlex
 import shutil
 import tempfile
 import time
+from urllib.parse import urlsplit
 
 import tornado.web
 from terminado import TermSocket, NamedTermManager
@@ -249,11 +250,37 @@ class WGTerminalPageHandler(tornado.web.RequestHandler):
         return self.render('termpage.html', static=self.static_url, ws_url_path='/websocket')
 
 
+def require_same_site(handler):
+    """CSRF guard for the state-changing GETs (/ and /new).
+
+    Browsers send Sec-Fetch-Site on every request: only same-origin and none
+    (typed URL, bookmark) may create a terminal. Without it (old clients,
+    curl) the Origin or Referer host must equal the Host header. Anything else
+    is refused with 403, so a foreign page cannot burn the user's terminal cap
+    with an <img>, redirect or link.
+    """
+    fetch_site = handler.request.headers.get('Sec-Fetch-Site')
+    if fetch_site is not None:
+        if fetch_site.strip().lower() in ('same-origin', 'none'):
+            return
+        raise tornado.web.HTTPError(403, reason='Cross-site request refused')
+    host = (handler.request.headers.get('Host') or '').strip().lower()
+    for name in ('Origin', 'Referer'):
+        value = handler.request.headers.get(name)
+        if value:
+            origin_host = (urlsplit(value).netloc or '').lower()
+            if host and origin_host == host:
+                return
+            raise tornado.web.HTTPError(403, reason='Cross-site request refused')
+    raise tornado.web.HTTPError(403, reason='Cross-site request refused')
+
+
 class WGNewTerminalHandler(tornado.web.RequestHandler):
     """Create a terminal for the requesting user and redirect to it."""
 
     def get(self):
         email = require_email(self)
+        require_same_site(self)
         manager = self.application.settings['term_manager']
         try:
             name, terminal = manager.create_terminal(email)
