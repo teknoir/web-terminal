@@ -68,15 +68,27 @@ class WGTestBase(AsyncHTTPTestCase):
 class TestAccess(WGTestBase):
     def test_csrf_cross_site_refused_and_creates_nothing(self):
         for path in ('/', '/new'):
-            for site in ('cross-site', 'same-site', ''):
+            for site in ('cross-site', ''):
                 resp = self.fetch_as(path, ALICE, headers={'Sec-Fetch-Site': site})
                 self.assertEqual(resp.code, 403, (path, site))
+            # A cross-site request a foreign page can trigger by itself (img,
+            # iframe, fetch, script redirect) is not a user-activated navigation.
+            for extra in ({'Sec-Fetch-Mode': 'no-cors', 'Sec-Fetch-Dest': 'image'},
+                          {'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'iframe', 'Sec-Fetch-User': '?1'},
+                          {'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document'}):
+                resp = self.fetch_as(path, ALICE, headers=dict(extra, **{'Sec-Fetch-Site': 'cross-site'}))
+                self.assertEqual(resp.code, 403, (path, extra))
         self.assertEqual(self.manager.terminals, {})
 
     def test_csrf_fetch_site_allowed(self):
-        for site in ('same-origin', 'none'):
+        # same-site: the link in Backstage (teknoir.cloud -> wgt-x.teknoir.cloud).
+        for site in ('same-origin', 'none', 'same-site'):
             resp = self.fetch_as('/new', ALICE, headers={'Sec-Fetch-Site': site})
             self.assertEqual(resp.code, 302, site)
+        # A click on a link from anywhere (user-activated top-level navigation).
+        resp = self.fetch_as('/new', ALICE, headers={'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate',
+                                                      'Sec-Fetch-Dest': 'document', 'Sec-Fetch-User': '?1'})
+        self.assertEqual(resp.code, 302)
 
     def test_csrf_without_fetch_metadata_needs_matching_origin(self):
         host = '127.0.0.1:%d' % self.get_http_port()
@@ -338,6 +350,19 @@ class TestDefaultModeUnchanged(AsyncHTTPTestCase):
         src = open(named.__file__).read()
         self.assertIn(r'(r"/(\w+)/websocket", TerminalSocket', src)
         self.assertIn(r'(r"/(\w+)/?", TerminalPageHandler)', src)
+
+
+class SameSiteTest(unittest.TestCase):
+    def test_same_site(self):
+        ok = [('wgt-a.teknoir.cloud', 'teknoir.cloud'), ('wgt-a.teknoir.cloud', 'x.teknoir.cloud:443'),
+              ('wgt-a.teknoir.cloud:443', 'wgt-a.teknoir.cloud'), ('127.0.0.1:8080', '127.0.0.1:9')]
+        bad = [('wgt-a.teknoir.cloud', 'evil.example'), ('wgt-a.teknoir.cloud', 'teknoir.cloud.evil.example'),
+               ('wgt-a.teknoir.cloud', 'eviltknoir.cloud'), ('127.0.0.1:8080', '127.0.0.1:8080.evil.example'),
+               ('127.0.0.1', '0.0.1'), ('teknoir.cloud', 'cloud'), ('wgt-a.teknoir.cloud', '')]
+        for h, o in ok:
+            self.assertTrue(wg_mode._same_site(h, o), (h, o))
+        for h, o in bad:
+            self.assertFalse(wg_mode._same_site(h, o), (h, o))
 
 
 class HoldOpenTest(unittest.TestCase):

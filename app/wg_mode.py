@@ -15,6 +15,7 @@ The default (deadend) mode in named.py is untouched. In this mode:
 """
 import datetime
 import logging
+import ipaddress
 import os
 import re
 import secrets
@@ -266,28 +267,66 @@ class WGTerminalPageHandler(tornado.web.RequestHandler):
         return self.render('termpage.html', static=self.static_url, ws_url_path='/websocket')
 
 
+def _hostname(netloc):
+    """Lower-case hostname of a Host header or URL netloc, without the port."""
+    try:
+        parts = urlsplit('//' + netloc)
+        parts.port  # raises ValueError for a malformed port such as '8080.evil.example'
+        return (parts.hostname or '').lower()
+    except ValueError:
+        return ''
+
+
+def _same_site(host, other):
+    """other is this host, its parent domain, or another host under the parent
+    domain (the terminal hosts sit one label below the platform domain).
+    IP addresses only match themselves."""
+    host, other = _hostname(host), _hostname(other)
+    if not host or not other:
+        return False
+    if other == host:
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    if host.count('.') < 2:
+        return False
+    parent = host.split('.', 1)[1]
+    return other == parent or other.endswith('.' + parent)
+
+
 def require_same_site(handler):
     """CSRF guard for the state-changing GETs (/ and /new).
 
-    Browsers send Sec-Fetch-Site on every request: only same-origin and none
-    (typed URL, bookmark) may create a terminal. Without it (old clients,
-    curl) the Origin or Referer host must equal the Host header. Anything else
-    is refused with 403, so a foreign page cannot burn the user's terminal cap
-    with an <img>, redirect or link.
+    Allowed: a same-origin or same-site request (Backstage on the parent domain
+    links here), a typed URL or bookmark (Sec-Fetch-Site: none), and any
+    user-activated top-level navigation (a click on a link: Sec-Fetch-Mode
+    navigate, Sec-Fetch-Dest document, Sec-Fetch-User ?1). Refused: requests a
+    foreign page can trigger on its own (img, iframe, fetch, script-driven
+    redirects), so it cannot burn the user's terminal cap. Without Sec-Fetch
+    headers (old clients, curl) the Origin or Referer must be same-site.
     """
-    fetch_site = handler.request.headers.get('Sec-Fetch-Site')
+    h = handler.request.headers
+    host = (h.get('Host') or '').strip().lower()
+    fetch_site = h.get('Sec-Fetch-Site')
     if fetch_site is not None:
-        if fetch_site.strip().lower() in ('same-origin', 'none'):
+        if fetch_site.strip().lower() in ('same-origin', 'same-site', 'none'):
+            return
+        if (h.get('Sec-Fetch-Mode', '').lower() == 'navigate'
+                and h.get('Sec-Fetch-Dest', '').lower() == 'document'
+                and h.get('Sec-Fetch-User', '') == '?1'):
             return
         raise tornado.web.HTTPError(403, reason='Cross-site request refused')
-    host = (handler.request.headers.get('Host') or '').strip().lower()
     for name in ('Origin', 'Referer'):
-        value = handler.request.headers.get(name)
+        value = h.get(name)
         if value:
-            origin_host = (urlsplit(value).netloc or '').lower()
-            if host and origin_host == host:
+            origin_host = urlsplit(value).netloc or ''
+            if host and origin_host and _same_site(host, origin_host):
                 return
             raise tornado.web.HTTPError(403, reason='Cross-site request refused')
+    raise tornado.web.HTTPError(403, reason='Cross-site request refused')
     raise tornado.web.HTTPError(403, reason='Cross-site request refused')
 
 
