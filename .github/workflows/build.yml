@@ -34,9 +34,8 @@ jobs:
           TAGS="${IMAGE}:${SAFE_BRANCH}-${TIMESTAMP}"
           TAGS="${TAGS},${IMAGE}:${SAFE_BRANCH}"
           TAGS="${TAGS},${IMAGE}:sha-${GITHUB_SHA::8}"
-          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
-            TAGS="${TAGS},${IMAGE}:latest"
-          fi
+          # ':latest' is frozen at digest sha256:6316438d667b82d5eccedf643eefa87d265eaa7f4d8b515d1c45bc37bc436c43
+          # because production legacy terminals pull it; move it only deliberately.
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v6
