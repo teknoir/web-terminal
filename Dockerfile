@@ -1,3 +1,9 @@
+# wg-connect: the ProxyCommand used by SSH_PROXY_MODE=wireguard.
+# WG_TUNNEL_REF is pinned to a wg-tunnel main commit sha; bump it for releases.
+FROM golang:1.26-alpine AS wg
+ARG WG_TUNNEL_REF=0331c2849daa08120f1a986973af8d94b2f4592f
+RUN CGO_ENABLED=0 GOBIN=/out go install -trimpath github.com/teknoir/wg-tunnel/cmd/wg-connect@${WG_TUNNEL_REF}
+
 FROM python:3.11-alpine
 
 # Set environment variables
@@ -15,6 +21,13 @@ RUN apk add --no-cache \
     tini \
     openssh-client \
     libwebsockets
+
+COPY --from=wg /out/wg-connect /usr/local/bin/wg-connect
+
+# The wireguard mode runs as uid/gid 65532 (device-controller terminalRunAsUser).
+# OpenSSH refuses to run for a uid without a passwd entry ("No user exists for
+# uid 65532"), so create one. HOME is the writable emptyDir at /tmp.
+RUN addgroup -g 65532 -S wgterm && adduser -S -D -H -u 65532 -G wgterm -h /tmp -s /sbin/nologin wgterm
 
 # Install Python dependencies
 COPY requirements.txt .

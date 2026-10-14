@@ -14,6 +14,7 @@ from tornado.ioloop import PeriodicCallback
 
 from terminado import TermSocket, NamedTermManager
 from common_demo_stuff import TEMPLATE_DIR, STATIC_DIR
+import wg_mode
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -60,12 +61,14 @@ async def cull_inactive_terminals(manager, timeout_sec):
                 logger.warning("Culling terminal '%s' due to %d seconds of inactivity.", name, int(seconds_inactive))
                 await manager.terminate(name, force=True)
 
-def main():
-    proxy_cmd = os.environ.get('PROXY_CMD')
-    rsa_key_file = os.environ.get('RSA_KEY_FILE', '/priv.pem')
-    remote_username = os.environ.get('REMOTE_USERNAME', 'teknoir')
-    remote_access_port = os.environ.get('REMOTE_ACCESS_PORT', '49322')
-    shell_command = [
+def default_shell_command(environ=None):
+    """The deadend-mode ssh command, built from the environment (PROXY_CMD from the entrypoint)."""
+    env = os.environ if environ is None else environ
+    proxy_cmd = env.get('PROXY_CMD')
+    rsa_key_file = env.get('RSA_KEY_FILE', '/priv.pem')
+    remote_username = env.get('REMOTE_USERNAME', 'teknoir')
+    remote_access_port = env.get('REMOTE_ACCESS_PORT', '49322')
+    return [
         'ssh',
         '-o', 'LogLevel=ERROR',
         '-o', f'ProxyCommand={proxy_cmd}',
@@ -77,7 +80,23 @@ def main():
         '-p', remote_access_port
     ]
 
-    term_manager = NamedTermManager(shell_command=shell_command, max_terminals=10000)
+
+def main():
+    proxy_mode = os.environ.get('SSH_PROXY_MODE') or 'deadend'
+    if proxy_mode not in ('deadend', 'wireguard'):
+        raise SystemExit(f"Unsupported SSH_PROXY_MODE '{proxy_mode}' (expected 'deadend' or 'wireguard')")
+    wireguard = proxy_mode == 'wireguard'
+
+    if wireguard:
+        try:
+            wg_config = wg_mode.WireGuardConfig.from_env()
+        except wg_mode.ConfigError as e:
+            raise SystemExit(f"SSH_PROXY_MODE=wireguard: {e}")
+        term_manager = wg_mode.WireGuardTermManager(wg_config, max_terminals=10000)
+        logger.info("SSH proxy mode: wireguard (device %s/%s via %s)",
+                    wg_config.namespace, wg_config.device, wg_config.hub_url)
+    else:
+        term_manager = NamedTermManager(shell_command=default_shell_command(), max_terminals=10000)
     
     terminal_timeout_sec = 60 * 60
     async def culler():
@@ -87,14 +106,17 @@ def main():
     logger.info("Starting terminal culler (interval=%ds, timeout=%ds)", culler_period_sec, terminal_timeout_sec)
     PeriodicCallback(culler, 1000 * culler_period_sec).start()
 
-    handlers = [
-        (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": STATIC_DIR}),
-        (r"/activity", ActivityHandler),
-        (r"/(\w+)/websocket", TerminalSocket, {'term_manager': term_manager}),
-        (r"/new/?", NewTerminalHandler),
-        (r"/", NewTerminalHandler),
-        (r"/(\w+)/?", TerminalPageHandler)
-    ]
+    if wireguard:
+        handlers = wg_mode.make_handlers(term_manager, ActivityHandler, {"path": STATIC_DIR})
+    else:
+        handlers = [
+            (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": STATIC_DIR}),
+            (r"/activity", ActivityHandler),
+            (r"/(\w+)/websocket", TerminalSocket, {'term_manager': term_manager}),
+            (r"/new/?", NewTerminalHandler),
+            (r"/", NewTerminalHandler),
+            (r"/(\w+)/?", TerminalPageHandler)
+        ]
     
     application = tornado.web.Application(
         handlers,
@@ -113,6 +135,9 @@ def main():
         logger.info("Shutting down on SIGINT")
     finally:
         term_manager.shutdown()
+        if wireguard:
+            for name in list(term_manager.workdirs):
+                term_manager.forget(name)
         loop.close()
 
 if __name__ == "__main__":
