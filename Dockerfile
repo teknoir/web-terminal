@@ -24,6 +24,11 @@ RUN apk add --no-cache \
 
 COPY --from=wg /out/wg-connect /usr/local/bin/wg-connect
 
+# The wireguard mode runs as uid/gid 65532 (device-controller terminalRunAsUser).
+# OpenSSH refuses to run for a uid without a passwd entry ("No user exists for
+# uid 65532"), so create one. HOME is the writable emptyDir at /tmp.
+RUN addgroup -g 65532 -S wgterm && adduser -S -D -H -u 65532 -G wgterm -h /tmp -s /sbin/nologin wgterm
+
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

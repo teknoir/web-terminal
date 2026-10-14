@@ -143,6 +143,22 @@ class WireGuardConfig:
         ]
 
 
+# Keeps the terminal open after ssh ends, so the user sees why (wg-connect prints
+# the hub's denial reason, e.g. device_offline or device_revoked) instead of the
+# page turning into a 404 when the process exits at once. The ssh argv is passed
+# as positional parameters ("$@"), never interpolated into the script.
+HOLD_SCRIPT = (
+    '"$@"; rc=$?; '
+    'printf \'\\r\\n[WireGuard session ended (exit %s). Open /new to reconnect.]\\r\\n\' "$rc"; '
+    'read -t 120 _ || true'
+)
+
+
+def hold_open(command):
+    """Wrap a terminal argv so the terminal stays readable after it exits."""
+    return ['/bin/sh', '-c', HOLD_SCRIPT, 'wgterm'] + list(command)
+
+
 class WireGuardTermManager(NamedTermManager):
     """NamedTermManager whose terminals are owned by one user each."""
 
@@ -190,7 +206,7 @@ class WireGuardTermManager(NamedTermManager):
         os.chmod(workdir, 0o700)
         try:
             command = self.config.build_command(email, os.path.join(workdir, 'known_hosts'))
-            name, term = self.new_named_terminal(name=name, shell_command=command)
+            name, term = self.new_named_terminal(name=name, shell_command=hold_open(command))
         except BaseException:
             shutil.rmtree(workdir, ignore_errors=True)
             raise

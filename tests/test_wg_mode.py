@@ -1,3 +1,4 @@
+import unittest
 import asyncio
 import os
 import re
@@ -221,8 +222,15 @@ class TestCleanup(WGTestBase):
                 return ['/nonexistent/definitely-not-here']
         manager = wg_mode.WireGuardTermManager(make_config(Broken))
         before = set(os.listdir(manager.tmp_root or '/tmp'))
-        with self.assertRaises(Exception):
-            manager.create_terminal(ALICE)
+        # hold_open would spawn /bin/sh successfully; bypass it so the spawn
+        # itself fails, which is the path under test.
+        orig = wg_mode.hold_open
+        wg_mode.hold_open = lambda command: list(command)
+        try:
+            with self.assertRaises(Exception):
+                manager.create_terminal(ALICE)
+        finally:
+            wg_mode.hold_open = orig
         after = set(os.listdir(manager.tmp_root or '/tmp'))
         self.assertEqual({d for d in after - before if d.startswith('wgterm-')}, set())
         self.assertEqual(manager.creators, {})
@@ -330,3 +338,18 @@ class TestDefaultModeUnchanged(AsyncHTTPTestCase):
         src = open(named.__file__).read()
         self.assertIn(r'(r"/(\w+)/websocket", TerminalSocket', src)
         self.assertIn(r'(r"/(\w+)/?", TerminalPageHandler)', src)
+
+
+class HoldOpenTest(unittest.TestCase):
+    def test_wraps_without_interpolation(self):
+        argv = ['ssh', '-o', 'ProxyCommand=wg-connect --on-behalf-of a@b.c', 'u@d; rm -rf /']
+        wrapped = wg_mode.hold_open(argv)
+        self.assertEqual(wrapped[:4], ['/bin/sh', '-c', wg_mode.HOLD_SCRIPT, 'wgterm'])
+        self.assertEqual(wrapped[4:], argv)
+
+    def test_script_runs_command_then_reports_exit(self):
+        import subprocess
+        out = subprocess.run(wg_mode.hold_open(['sh', '-c', 'echo denied >&2; exit 3']),
+                             input=b'\n', capture_output=True, timeout=10)
+        self.assertIn(b'denied', out.stderr)
+        self.assertIn(b'WireGuard session ended (exit 3)', out.stdout)
