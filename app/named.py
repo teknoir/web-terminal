@@ -82,6 +82,14 @@ async def cull_inactive_terminals(manager, timeout_sec):
                 logger.warning("Culling terminal '%s' due to %d seconds of inactivity.", name, int(seconds_inactive))
                 await manager.terminate(name, force=True)
 
+def make_culler(manager, environ=None):
+    """(culler coroutine function, idle timeout in seconds taken from TERMINAL_IDLE_TIMEOUT_SEC)."""
+    timeout_sec = idle_timeout_from_env(environ)
+    async def culler():
+        await cull_inactive_terminals(manager, timeout_sec)
+    return culler, timeout_sec
+
+
 def make_application(handlers, **settings):
     """Application with the anti-framing headers on every response."""
     return tornado.web.Application(handlers, transforms=security.TRANSFORMS, **settings)
@@ -124,9 +132,7 @@ def main():
     else:
         term_manager = NamedTermManager(shell_command=default_shell_command(), max_terminals=10000)
     
-    terminal_timeout_sec = idle_timeout_from_env()
-    async def culler():
-        await cull_inactive_terminals(term_manager, terminal_timeout_sec)
+    culler, terminal_timeout_sec = make_culler(term_manager)
     
     culler_period_sec = 10
     logger.info("Starting terminal culler (interval=%ds, timeout=%ds)", culler_period_sec, terminal_timeout_sec)

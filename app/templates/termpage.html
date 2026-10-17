@@ -77,7 +77,7 @@
       var data_disposable = null;
       var title_disposable = null;
 
-      // Reconnect policy (kept pure so it can be checked by hand in a console):
+      // Reconnect policy (kept pure; exposed as window.reconnect_decision for manual checks in a console):
       //   info = {opened: bool, lived_ms: ms between open and close, ended: server ended the
       //           session (disconnect message or normal close), failures: consecutive failures so far}
       // returns {action: "retry", delay_ms, failures} or {action: "end"}.
@@ -88,6 +88,8 @@
         if (failures > MAX_FAILURES) return {action: "end"};
         return {action: "retry", delay_ms: 1000 * Math.pow(2, failures - 1), failures: failures};
       }
+
+      window.reconnect_decision = reconnect_decision;
 
       function show_session_ended() {
         if (document.getElementById("session-ended")) return;
@@ -106,7 +108,10 @@
         btn.type = "button";
         btn.textContent = "Open a new terminal";
         btn.style.cssText = "font:inherit;padding:6px 14px;cursor:pointer";
-        btn.onclick = function() { window.location.href = window.location.pathname.endsWith("/") ? "../new" : "new"; };
+        btn.onclick = function() { var p = window.location.pathname;
+          // single/unique modes serve the terminal at "/" and have no /new route: reload it
+          if (p === "/" || p === "") window.location.reload();
+          else window.location.href = p.endsWith("/") ? "../new" : "new"; };
         box.appendChild(msg);
         box.appendChild(btn);
         document.body.appendChild(box);
@@ -154,7 +159,7 @@
           var d = reconnect_decision({
             opened: opened_at !== null,
             lived_ms: opened_at === null ? 0 : Date.now() - opened_at,
-            ended: ended || (opened_at !== null && event.code === 1000),
+            ended: ended || (opened_at !== null && event.code === 1000 && Date.now() - opened_at >= MIN_LIVE_MS),
             failures: failures
           });
           if (d.action === "retry") {

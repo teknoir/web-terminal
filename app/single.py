@@ -31,6 +31,22 @@ class TerminalPageHandler(tornado.web.RequestHandler):
         return self.render("termpage.html", static=self.static_url,
                            ws_url_path="/websocket")
 
+def make_app(term_manager):
+    """Application with the anti-framing headers on every response."""
+    handlers = [
+        (r"/websocket", ExtendedTermSocket, {'term_manager': term_manager}),
+        (r"/activity", ActivityHandler),
+        (r"/", TerminalPageHandler)
+    ]
+    return tornado.web.Application(
+        handlers,
+        transforms=security.TRANSFORMS,
+        static_path=STATIC_DIR,
+        template_path=TEMPLATE_DIR,
+        last_used_time=int(time.time())
+    )
+
+
 def main():
     proxy_cmd = os.environ.get('PROXY_CMD')
     rsa_key_file = os.environ.get('RSA_KEY_FILE', '/priv.pem')
@@ -49,18 +65,7 @@ def main():
     ]
 
     term_manager = SingleTermManager(shell_command=shell_command)
-    handlers = [
-        (r"/websocket", ExtendedTermSocket, {'term_manager': term_manager}),
-        (r"/activity", ActivityHandler),
-        (r"/", TerminalPageHandler)
-    ]
-    app = tornado.web.Application(
-        handlers,
-        transforms=security.TRANSFORMS,
-        static_path=STATIC_DIR,
-        template_path=TEMPLATE_DIR,
-        last_used_time=int(time.time())
-    )
+    app = make_app(term_manager)
     
     port = int(os.environ.get('PORT', 8080))
     app.listen(port, address='0.0.0.0')
