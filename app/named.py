@@ -15,9 +15,30 @@ from tornado.ioloop import PeriodicCallback
 from terminado import TermSocket, NamedTermManager
 from common_demo_stuff import TEMPLATE_DIR, STATIC_DIR
 import wg_mode
+import security
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+DEFAULT_IDLE_TIMEOUT_SEC = 3600
+
+
+def idle_timeout_from_env(environ=None):
+    """TERMINAL_IDLE_TIMEOUT_SEC as an int > 0; unset, invalid or <= 0 gives the default (with a warning)."""
+    env = os.environ if environ is None else environ
+    raw = env.get('TERMINAL_IDLE_TIMEOUT_SEC')
+    if raw is None or raw.strip() == '':
+        return DEFAULT_IDLE_TIMEOUT_SEC
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning("Invalid TERMINAL_IDLE_TIMEOUT_SEC=%r (need an integer > 0); using %d",
+                       raw, DEFAULT_IDLE_TIMEOUT_SEC)
+        return DEFAULT_IDLE_TIMEOUT_SEC
+    return value
+
 
 class ActivityHandler(tornado.web.RequestHandler):
     def get(self):
@@ -61,6 +82,19 @@ async def cull_inactive_terminals(manager, timeout_sec):
                 logger.warning("Culling terminal '%s' due to %d seconds of inactivity.", name, int(seconds_inactive))
                 await manager.terminate(name, force=True)
 
+def make_culler(manager, environ=None):
+    """(culler coroutine function, idle timeout in seconds taken from TERMINAL_IDLE_TIMEOUT_SEC)."""
+    timeout_sec = idle_timeout_from_env(environ)
+    async def culler():
+        await cull_inactive_terminals(manager, timeout_sec)
+    return culler, timeout_sec
+
+
+def make_application(handlers, **settings):
+    """Application with the anti-framing headers on every response."""
+    return tornado.web.Application(handlers, transforms=security.TRANSFORMS, **settings)
+
+
 def default_shell_command(environ=None):
     """The deadend-mode ssh command, built from the environment (PROXY_CMD from the entrypoint)."""
     env = os.environ if environ is None else environ
@@ -98,9 +132,7 @@ def main():
     else:
         term_manager = NamedTermManager(shell_command=default_shell_command(), max_terminals=10000)
     
-    terminal_timeout_sec = 60 * 60
-    async def culler():
-        await cull_inactive_terminals(term_manager, terminal_timeout_sec)
+    culler, terminal_timeout_sec = make_culler(term_manager)
     
     culler_period_sec = 10
     logger.info("Starting terminal culler (interval=%ds, timeout=%ds)", culler_period_sec, terminal_timeout_sec)
@@ -118,7 +150,7 @@ def main():
             (r"/(\w+)/?", TerminalPageHandler)
         ]
     
-    application = tornado.web.Application(
+    application = make_application(
         handlers,
         template_path=TEMPLATE_DIR,
         term_manager=term_manager,

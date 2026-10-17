@@ -77,10 +77,56 @@
       var data_disposable = null;
       var title_disposable = null;
 
+      // Reconnect policy (kept pure; exposed as window.reconnect_decision for manual checks in a console):
+      //   info = {opened: bool, lived_ms: ms between open and close, ended: server ended the
+      //           session (disconnect message or normal close), failures: consecutive failures so far}
+      // returns {action: "retry", delay_ms, failures} or {action: "end"}.
+      var MAX_FAILURES = 3, MIN_LIVE_MS = 2000;
+      function reconnect_decision(info) {
+        if (info.opened && (info.ended || info.lived_ms >= MIN_LIVE_MS)) return {action: "end"};
+        var failures = info.failures + 1; // closed without opening, or within 2 s of opening
+        if (failures > MAX_FAILURES) return {action: "end"};
+        return {action: "retry", delay_ms: 1000 * Math.pow(2, failures - 1), failures: failures};
+      }
+
+      window.reconnect_decision = reconnect_decision;
+
+      function show_session_ended() {
+        if (document.getElementById("session-ended")) return;
+        var box = document.createElement("div");
+        box.id = "session-ended";
+        box.setAttribute("role", "alertdialog");
+        box.setAttribute("aria-labelledby", "session-ended-msg");
+        box.style.cssText = "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);" +
+          "background:#1e1e1e;color:#fff;border:1px solid #888;border-radius:6px;padding:20px 28px;" +
+          "font:16px sans-serif;text-align:center;z-index:10";
+        var msg = document.createElement("p");
+        msg.id = "session-ended-msg";
+        msg.textContent = "Session ended";
+        msg.style.cssText = "margin:0 0 14px;font-size:20px";
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = "Open a new terminal";
+        btn.style.cssText = "font:inherit;padding:6px 14px;cursor:pointer";
+        btn.onclick = function() { var p = window.location.pathname;
+          // single/unique modes serve the terminal at "/" and have no /new route: reload it
+          if (p === "/" || p === "") window.location.reload();
+          else window.location.href = p.endsWith("/") ? "../new" : "new"; };
+        box.appendChild(msg);
+        box.appendChild(btn);
+        document.body.appendChild(box);
+        btn.focus();
+      }
+
+      var failures = 0;
+
       function make_reconnecting_terminal(ws_url) {
+        var opened_at = null;
+        var ended = false;
         ws = new WebSocket(ws_url);
 
         ws.onopen = function(event) {
+          opened_at = Date.now();
           // Send initial size
           ws.send(JSON.stringify(['set_size', term.rows, term.cols]));
 
@@ -99,6 +145,7 @@
                 term.write(json_msg[1]);
                 break;
               case "disconnect":
+                ended = true;
                 term.write("\r\n\r\n[Session was closed (maybe due to inactivity)]\r\n");
                 break;
             }
@@ -109,9 +156,18 @@
           console.log('WebSocket closed');
           if (data_disposable) data_disposable.dispose();
           if (title_disposable) title_disposable.dispose();
-          setTimeout(function() {
-            make_reconnecting_terminal(ws_url);
-          }, 500);
+          var d = reconnect_decision({
+            opened: opened_at !== null,
+            lived_ms: opened_at === null ? 0 : Date.now() - opened_at,
+            ended: ended || (opened_at !== null && event.code === 1000 && Date.now() - opened_at >= MIN_LIVE_MS),
+            failures: failures
+          });
+          if (d.action === "retry") {
+            failures = d.failures;
+            setTimeout(function() { make_reconnecting_terminal(ws_url); }, d.delay_ms);
+          } else {
+            show_session_ended();
+          }
         };
       }
 
