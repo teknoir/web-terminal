@@ -9,6 +9,7 @@ import tornado.web
 import tornado.ioloop
 
 from terminado import TermSocket, SingleTermManager
+import security
 from common_demo_stuff import TEMPLATE_DIR, STATIC_DIR
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,6 +56,7 @@ def main():
     ]
     app = tornado.web.Application(
         handlers,
+        transforms=security.TRANSFORMS,
         static_path=STATIC_DIR,
         template_path=TEMPLATE_DIR,
         last_used_time=int(time.time())
