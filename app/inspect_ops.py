@@ -16,7 +16,8 @@ Rules, in short (the full wire contract is plans/nextgen/inspect.md section 3):
   terminal.
 * Output is capped and pruned. A helm release manifest is never parsed here: it goes to the
   device on stdin of `kubectl create --dry-run=client -o json -f -` (Kubernetes' own decoder) and
-  only the JSON objects that come back are returned, Secret values hidden. Content is never logged.
+  only the JSON objects that come back are returned, Secret values hidden. Objects keep the namespace
+  they name; one that names none shows the kubeconfig default (`default`), not the release namespace. Content is never logged.
 
 The module is deliberately not called ``inspect.py``: app/ is on sys.path first
 and would shadow the standard library module of that name.
@@ -82,9 +83,13 @@ RELEASE_SECRET_CAP = 3 * 1024 * 1024
 RELEASE_JSON_CAP = 8 * 1024 * 1024
 # The backend refuses a manifest over 2 MiB (RELEASE_MAX_MANIFEST_BYTES), so the pod stops there too.
 MANIFEST_CAP = 2 * 1024 * 1024
+# kubectl prints the objects pretty-printed (about 2.5 times the YAML), so its stdout may be 4 times
+# the manifest cap; the objects are then measured as compact JSON against MANIFEST_CAP, which is how
+# the backend measures them.
+KUBECTL_OUT_CAP = 4 * MANIFEST_CAP
 RELEASE_JSON_CONTAINERS = 400000      # objects plus arrays in the decoded release JSON
 # Objects (after flattening Lists) and printed JSON values kubectl may return for one release; its
-# JSON text is bounded by MANIFEST_CAP and the count of `{` and `[` in it before json parses it.
+# JSON text is bounded by KUBECTL_OUT_CAP and the count of `{` and `[` in it before json parses it.
 RELEASE_MAX_OBJECTS = 2000
 RELEASE_OBJECTS_CONTAINERS = 200000
 MAX_LIST_DEPTH = 8
@@ -271,10 +276,12 @@ def kubectl_argv(req, revision=None):
 def kubectl_manifest_argv(req):
     """The release manifest goes to this command on STDIN (never as an argument): kubectl decodes it
     with Kubernetes' own decoder and prints the objects as JSON; nothing is sent to the API server
-    but the discovery calls that map each kind. `-n` only supplies the namespace of objects that name
-    none (as helm does), so the output shows where each object lands."""
-    return KUBECTL + ['-n', req.fields['namespace'], 'create', '--dry-run=client', '--validate=false',
-                      '-o', 'json', '-f', '-']
+    but the discovery calls that map each kind. There is deliberately no `-n`: it makes kubectl ENFORCE
+    that namespace, so every namespaced object that names another one (helm and k3s install those)
+    would be refused and missing. Without it each object keeps the namespace it names; one that names
+    none gets the kubeconfig default (`default`) from kubectl, which cannot be told apart from an
+    object that names `default`, so such objects show `default` rather than the release namespace."""
+    return KUBECTL + ['create', '--dry-run=client', '--validate=false', '-o', 'json', '-f', '-']
 
 
 def remote_command(argv):
@@ -497,15 +504,31 @@ def pick_revision(rows, wanted):
     return rows[0][0] if rows else None
 
 
-_JSON_STRING = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
-_JSON_BRACKETS = re.compile(rb'[{}\[\]]')
+# A string token is `"` plus everything up to the next `"`, or up to the end when it never closes
+# (`"?`), so the pattern cannot fail once it has started: no backtracking, linear in the input. It
+# only works on text whose escapes were neutralised first (json_too_deep does that).
+_JSON_TOKEN = re.compile(rb'"[^"]*"?|([{}\[\]])')
 
 
 def json_too_deep(raw, limit=JSON_MAX_DEPTH):
-    """True when the JSON text nests `{`/`[` deeper than `limit`. Strings are blanked first (in C), then
-    only the brackets are walked, so this is cheap and never recurses. Run before json.loads."""
+    """True when the JSON text nests `{`/`[` deeper than `limit`. Linear in len(raw), never recurses.
+    Run before json.loads.
+
+    The scan is a state machine (outside a string, inside a string, escape) whose state changes are
+    done by C code only: (1) every backslash pair `\\\\` and then every escaped quote `\\"` is
+    overwritten with filler of the same length (bytes.replace goes left to right without overlap, so
+    a run of backslashes pairs up exactly as a JSON string reads it), which leaves no escape that can
+    end a string; (2) one regex pass takes each whole string (an unterminated one runs to the end) or
+    one bracket; (3) the brackets are counted with a depth counter that stops at the limit. A
+    regex of the shape `"[^"\\]*(?:\\.[^"\\]*)*"` instead backtracks quadratically on an unterminated
+    string, and a repeated `(?:\\.)` group costs ~60 bytes of heap per escape. An unterminated string
+    is not an error here: its bracket depth was checked up to that point and json.loads (or the
+    object-stream reader) rejects the text itself."""
+    flat = raw.replace(b'\\\\', b'\0\0').replace(b'\\"', b'\0\0')
     depth = 0
-    for bracket in _JSON_BRACKETS.findall(_JSON_STRING.sub(b'""', raw)):
+    for bracket in _JSON_TOKEN.findall(flat):
+        if not bracket:
+            continue
         if bracket in (b'{', b'['):
             depth += 1
             if depth > limit:
@@ -568,7 +591,8 @@ def decode_release(secret_b64):
 _LAST_APPLIED = 'last-applied-configuration'
 _API_DOWN_RE = re.compile(r'connection refused|i/o timeout|deadline exceeded|Client\.Timeout|'
                           r'TLS handshake timeout|no route to host|server is currently unable', re.I)
-_ERROR_LINE_RE = re.compile(r'^(?:error:|Error from server|Error:|unable to recognize)')
+# With several failed documents kubectl prints the `resource mapping not found` lines without a prefix.
+_ERROR_LINE_RE = re.compile(r'^(?:error:|Error from server|Error:|unable to recognize|resource mapping not found)')
 _NO_KIND_RE = re.compile(r'no matches for kind "([A-Za-z][A-Za-z0-9.]{0,62})"')
 # Fixed sentences only: kubectl's own text can quote document content (go-yaml puts the offending
 # value in `cannot unmarshal !!str ...`), so the reason is chosen by pattern, never copied.
@@ -764,6 +788,12 @@ def shape_release_objects(kept, rows, name, namespace, revision, rc, out, err, b
     deadline = time.monotonic() + budget
     values, complete = parse_object_stream(out, deadline)
     objects, hidden = redact_objects(values, deadline)
+    # kubectl's JSON is indented; what counts is the compact form (the backend measures that)
+    compact = json.dumps(objects, separators=(',', ':'), ensure_ascii=False)
+    if len(compact.encode('utf-8', 'replace')) > MANIFEST_CAP:
+        raise Failure('too_large', 'The rendered objects are too large to read.')
+    del compact
+    _check_budget(deadline)
     if not values:
         text = err.decode('utf-8', 'replace')
         if rc != 0 and 'no objects passed to create' in text:
@@ -1087,7 +1117,7 @@ class InspectRunner:
             self.pool, '_jobs', MAX_RELEASE_JOBS,
             lambda: decode_checked(text, name, namespace, revision, budget=budget))
         if manifest.strip():
-            rc, out, err, over = await self._remote(st, kubectl_manifest_argv(req), MANIFEST_CAP,
+            rc, out, err, over = await self._remote(st, kubectl_manifest_argv(req), KUBECTL_OUT_CAP,
                                                     stdin_data=manifest)
             if over:
                 raise Failure('too_large', 'The rendered manifest is too large to read.')

@@ -756,6 +756,92 @@ class TestRelease(unittest.TestCase):
         self.assertFalse(inspect_ops.json_too_deep(b'[' * 200 + b']' * 200))
         self.assertEqual(self.shape(deep_text)['objects'][0]['kind'], 'A')
 
+    def test_compact_json_over_the_manifest_cap_is_too_large(self):
+        big = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'big'},
+               'data': {'k': 'x' * (inspect_ops.MANIFEST_CAP + 1)}}
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            self.shape(json.dumps(big))
+        self.assertEqual(cm.exception.code, 'too_large')
+        big['data']['k'] = 'x' * (inspect_ops.MANIFEST_CAP - 1000)
+        self.assertEqual(len(self.shape(json.dumps(big, indent=4))['objects']), 1)
+        self.assertEqual(inspect_ops.KUBECTL_OUT_CAP, 4 * inspect_ops.MANIFEST_CAP)
+
+    def test_an_object_in_another_namespace_is_present(self):
+        # no `-n` on the command: kubectl keeps the namespace an object names (helm/k3s install such objects)
+        other = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'kube-cfg', 'namespace': 'kube-system'}}
+        unnamed = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'x', 'namespace': 'default'}}
+        out = self.shape(kubectl_out(other, CONFIGMAP_OBJ, unnamed))
+        self.assertEqual([(o['metadata']['name'], o['metadata']['namespace']) for o in out['objects']],
+                         [('kube-cfg', 'kube-system'), ('nvr-config', 'teknoir-demo'), ('x', 'default')])
+        self.assertEqual(out['hidden'], [])
+
+    def test_unprefixed_resource_mapping_lines_give_one_reason_per_kind(self):
+        err = ('resource mapping not found for name: "f1" namespace: "" from "STDIN": no matches for kind "Foo" '
+               'in version "x/v1"\nensure CRDs are installed first\n'
+               'resource mapping not found for name: "b1" namespace: "" from "STDIN": no matches for kind "Bar.baz" '
+               'in version "y/v2"\nensure CRDs are installed first\n'
+               'resource mapping not found for name: "f2" namespace: "" from "STDIN": no matches for kind "Foo" '
+               'in version "x/v1"\nensure CRDs are installed first\n'
+               'resource mapping not found for name: "w" namespace: "" from "STDIN": no matches for kind '
+               '"Evil kind hunter2" in version "z/v1"\nensure CRDs are installed first\n')
+        out = self.shape(KUBECTL_OK, rc=1, err=err)
+        self.assertEqual(out['hidden'], [
+            {'reason': 'an object of the unknown kind Foo (its CRD is not installed on the robot)'},
+            {'reason': 'an object of the unknown kind Bar.baz (its CRD is not installed on the robot)'},
+            {'reason': 'an object of an unknown kind (its CRD is not installed on the robot)'}])
+        self.assertNotIn('hunter2', json.dumps(out))
+        # with no object at all the reasons are in the error message, still fixed text
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            self.shape('', rc=1, err=err)
+        self.assertIn('unknown kind Foo', cm.exception.message)
+        self.assertNotIn('hunter2', cm.exception.message)
+
+    def test_json_depth_scanner_is_linear_on_adversarial_strings(self):
+        for raw in (b'"' + b'\\"' * (1 << 20),                 # 2 MiB: unterminated, every quote escaped
+                    b'"' + b'\\' * (1 << 20) + b'"',           # backslash pairs, terminated
+                    b'"",' * 700000, b'"a\\"b",' * 300000, b'[]' * (1 << 20), b'\\' * (2 << 20),
+                    b'[' * 100 + b'"' + b'\\"' * (1 << 20)):
+            started = time.monotonic()
+            self.assertFalse(inspect_ops.json_too_deep(raw))
+            self.assertLess(time.monotonic() - started, 0.5, raw[:12])
+        started = time.monotonic()
+        self.assertTrue(inspect_ops.json_too_deep(b'[' * 201 + b'"' + b'\\"' * (1 << 20)))
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_json_depth_scanner_agrees_with_a_reference_state_machine(self):
+        import random
+
+        def reference(raw, limit):
+            # Inside a string a backslash escapes the next byte. Outside a string a backslash is
+            # invalid JSON (the parser stops there, so only text that is refused anyway differs);
+            # the scanner reads a doubled backslash and a backslash-quote as a pair there too.
+            depth, in_str, i = 0, False, 0
+            while i < len(raw):
+                c = raw[i]
+                if c == 0x5c and (in_str or raw[i + 1:i + 2] in (b'\\', b'"')):
+                    i += 2
+                    continue
+                if in_str:
+                    if c == 0x22:
+                        in_str = False
+                elif c == 0x22:
+                    in_str = True
+                elif c in b'{[':
+                    depth += 1
+                    if depth > limit:
+                        return True
+                elif c in b'}]':
+                    depth -= 1
+                i += 1
+            return False
+
+        rnd = random.Random(7)
+        alphabet = [b'"', b'\\', b'[', b']', b'{', b'}', b'a', b' ', b'\n']
+        for _ in range(4000):
+            raw = b''.join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 40)))
+            for limit in (0, 1, 3):
+                self.assertEqual(inspect_ops.json_too_deep(raw, limit), reference(raw, limit), (raw, limit))
+
     def test_the_budget_stops_the_shaping(self):
         with self.assertRaises(inspect_ops.Failure) as cm:
             self.shape(KUBECTL_OK, budget=-1)
@@ -770,8 +856,11 @@ class TestRelease(unittest.TestCase):
         req = inspect_ops.parse_request({'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr',
                                          'revision': 2})
         argv = inspect_ops.kubectl_manifest_argv(req)
-        self.assertEqual(argv, ['sudo', '-n', 'k3s', 'kubectl', '--request-timeout=15s', '-n', 'teknoir-demo',
+        # no `-n`: it would make kubectl refuse every object that names another namespace
+        self.assertEqual(argv, ['sudo', '-n', 'k3s', 'kubectl', '--request-timeout=15s',
                                 'create', '--dry-run=client', '--validate=false', '-o', 'json', '-f', '-'])
+        self.assertNotIn('-n', argv[4:])
+        self.assertNotIn('teknoir-demo', argv)
         self.assertEqual(shlex.split(inspect_ops.remote_command(argv)), argv)
 
     def decode(self, data, rev=3, name='nvr', ns='teknoir-demo', **kw):
@@ -1239,8 +1328,7 @@ class TestEndpoint(InspectHTTPBase):
         call = calls[0]
         self.assertEqual(base64.b64decode(call['stdin_b64']), odd.encode('utf-8'))
         # the remote command is exactly the fixed one: the manifest is in no argument, nowhere
-        self.assertEqual(call['argv'][-1], self.K + ' -n teknoir-demo create --dry-run=client --validate=false '
-                                                    '-o json -f -')
+        self.assertEqual(call['argv'][-1], self.K + ' create --dry-run=client --validate=false -o json -f -')
         self.assertEqual(call['argv'][-2], '--')
         for arg in call['argv']:
             self.assertNotIn('touch', arg)
@@ -1301,8 +1389,20 @@ class TestEndpoint(InspectHTTPBase):
             self.assertNotIn('hunter2', json.dumps(error))
 
     def test_release_oversized_kubectl_output_is_too_large(self):
-        self.release_scenario({'stdout_bytes': inspect_ops.MANIFEST_CAP + 10})
+        self.release_scenario({'stdout_bytes': inspect_ops.KUBECTL_OUT_CAP + 10})
         self.err(self.post(self.REL), 413, 'too_large')
+
+    def test_release_pretty_printed_output_over_the_manifest_cap_is_fine_when_compact_is_under(self):
+        # kubectl indents: the raw stdout may be 4x MANIFEST_CAP, only the compact JSON is capped
+        pad = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'big'},
+               'data': {'k%d' % i: 'v' for i in range(100000)}}
+        raw = kubectl_out(pad)
+        compact = len(json.dumps(pad, separators=(',', ':')))
+        self.assertGreater(len(raw), inspect_ops.MANIFEST_CAP)
+        self.assertLess(compact, inspect_ops.MANIFEST_CAP)
+        self.release_scenario({'stdout': raw})
+        result = self.body_of(self.post(self.REL))['result']
+        self.assertEqual(result['objects'][0]['metadata']['name'], 'big')
 
     def test_release_kubectl_failures_that_are_not_about_the_manifest(self):
         self.release_scenario({'rc': 1, 'stderr': 'sudo: a password is required'})
