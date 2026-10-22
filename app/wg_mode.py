@@ -114,8 +114,12 @@ class WireGuardConfig:
         # api.KnownHostsAlias(namespace, device) in github.com/teknoir/wg-tunnel/pkg/api
         return '%s.%s.ztna.teknoir' % (self.device, self.namespace)
 
-    def build_command(self, email, known_hosts_file):
-        """argv for one terminal. The email must already be validated."""
+    @property
+    def destination(self):
+        return '%s@%s' % (self.remote_username, self.device)
+
+    def ssh_options(self, email, known_hosts_file):
+        """ssh options between `ssh` and the destination. The email must already be validated."""
         if normalize_email(email) is None:
             raise ValueError('invalid email')
         proxy_argv = [
@@ -132,7 +136,6 @@ class WireGuardConfig:
         # ssh runs ProxyCommand through the shell and expands '%' tokens in it.
         proxy_command = ' '.join(shlex.quote(a) for a in proxy_argv).replace('%', '%%')
         return [
-            'ssh',
             '-o', 'LogLevel=ERROR',
             '-o', 'ProxyCommand=' + proxy_command,
             '-o', 'UserKnownHostsFile=' + known_hosts_file,
@@ -140,8 +143,11 @@ class WireGuardConfig:
             '-o', 'HostKeyAlias=' + self.host_key_alias,
             '-o', 'ServerAliveInterval=30',
             '-i', self.rsa_key_file,
-            '%s@%s' % (self.remote_username, self.device),
         ]
+
+    def build_command(self, email, known_hosts_file):
+        """argv for one terminal. The email must already be validated."""
+        return ['ssh'] + self.ssh_options(email, known_hosts_file) + [self.destination]
 
 
 # Keeps the terminal open after ssh ends, so the user sees why (wg-connect prints

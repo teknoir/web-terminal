@@ -14,6 +14,7 @@ from tornado.ioloop import PeriodicCallback
 
 from terminado import TermSocket, NamedTermManager
 from common_demo_stuff import TEMPLATE_DIR, STATIC_DIR
+import inspect_ops
 import wg_mode
 import security
 
@@ -160,12 +161,31 @@ def main():
     server_port = int(os.environ.get('PORT', 8080))
     application.listen(server_port, address='0.0.0.0')
     logger.info("Server listening on 0.0.0.0:%d", server_port)
+
+    inspect_listener = None
+    if wireguard:
+        # Read-only inspect API for the Backstage backend, on its own port. Off unless
+        # INSPECT_PRINCIPALS (set by device-controller) names who may call it.
+        principals = inspect_ops.parse_principals(os.environ.get('INSPECT_PRINCIPALS'))
+        inspect_port = int(os.environ.get('INSPECT_PORT', 8091))
+        if inspect_port == server_port:
+            raise SystemExit("INSPECT_PORT must differ from PORT")
+        inspect_listener = inspect_ops.start_inspect_listener(wg_config, principals, inspect_port)
+        if inspect_listener:
+            logger.info("Inspect API listening on 0.0.0.0:%d for %d principal(s)", inspect_port, len(principals))
+        else:
+            logger.info("Inspect API off (no INSPECT_PRINCIPALS)")
     loop = tornado.ioloop.IOLoop.current()
     try:
         loop.start()
     except KeyboardInterrupt:
         logger.info("Shutting down on SIGINT")
     finally:
+        if inspect_listener:
+            try:
+                loop.run_sync(inspect_listener[0].settings['inspect_runner'].close)
+            except Exception:
+                logger.exception("Closing inspect masters failed")
         term_manager.shutdown()
         if wireguard:
             for name in list(term_manager.workdirs):
