@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tracemalloc
 import unittest
 
 import tornado.web
@@ -936,6 +937,186 @@ class TestRelease(unittest.TestCase):
             raise box['error']
         return box['value']
 
+    # -- JSON value bound, UTF-8 decoding, metadata cap
+
+    def record(self, body):
+        """A decode_release input: `body` (bytes, up to 8 MiB) gzipped and base64 twice."""
+        return base64.b64encode(base64.b64encode(gzip.compress(body))).decode()
+
+    def measured(self, fn):
+        """(result or Failure code, seconds, tracemalloc peak bytes above the start) of fn()."""
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        base = tracemalloc.get_traced_memory()[0]
+        started = time.monotonic()
+        try:
+            try:
+                out = fn()
+            except inspect_ops.Failure as f:
+                out = f.code
+            peak = tracemalloc.get_traced_memory()[1] - base
+        finally:
+            tracemalloc.stop()
+        return out, time.monotonic() - started, peak
+
+    def adversarial_8mib(self):
+        size = inspect_ops.RELEASE_JSON_CAP
+        def fit(head, unit, tail):
+            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+        pieces = {
+            'short strings': fit(b'[', b'"a",', b'"a"]'),
+            'short strings spaced': fit(b'[', b'"a" ,', b'"a"]'),
+            'floats': fit(b'[', b'1.5,', b'1.5]'),
+            'ints': fit(b'[', b'1,', b'1]'),
+            'keys': fit(b'{', b'"k":1,', b'"k":1}'),
+            'close brackets': b'}' * size,
+            'empty objects': fit(b'[', b'{},', b'{}]'),
+        }
+        for name, body in pieces.items():
+            self.assertLessEqual(len(body), size, name)
+            self.assertGreater(len(body), size - 64, name)
+        return pieces
+
+    def test_release_value_count_is_bounded_at_the_real_input_size(self):
+        for name, body in self.adversarial_8mib().items():
+            out, secs, peak = self.measured(lambda: inspect_ops.decode_release(self.record(body)))
+            self.assertEqual(out, 'too_large', name)
+            self.assertLess(secs, 3.0, name)
+            self.assertLess(peak, 64 * 1024 * 1024, (name, peak))
+
+    def test_scanner_alone_is_quick_and_bounded_at_8mib(self):
+        for name, body in self.adversarial_8mib().items():
+            out, secs, peak = self.measured(lambda: inspect_ops.json_scan(body, inspect_ops.RELEASE_JSON_VALUES))
+            self.assertEqual(out, 'values', name)
+            self.assertLess(secs, 1.0, name)
+            self.assertLess(peak, 64 * 1024 * 1024, (name, peak))
+
+    def test_kubectl_stream_value_count_is_bounded_at_the_real_input_size(self):
+        for name, body in self.adversarial_8mib().items():
+            body = body[:inspect_ops.KUBECTL_OUT_CAP]
+            out, secs, peak = self.measured(lambda: inspect_ops.parse_object_stream(body))
+            self.assertEqual(out, 'too_large', name)
+            self.assertLess(secs, 1.0, name)
+            self.assertLess(peak, 64 * 1024 * 1024, (name, peak))
+
+    def test_value_count_counts_the_values_outside_strings_only(self):
+        big_string = b'{"a":"' + b',:[]{}' * 100000 + b'"}'          # 3 values and 1 big string
+        self.assertIsNone(inspect_ops.json_scan(big_string, 3))
+        self.assertEqual(inspect_ops.json_scan(big_string, 2), 'values')
+        self.assertIsNone(inspect_ops.json_scan(b'[1,2,3]', 7))     # 2 brackets and 2 commas ... plus
+        self.assertEqual(inspect_ops.json_scan(b'[1,2,3]', 3), 'values')
+        # a realistic record is far under the limit
+        self.assertEqual(inspect_ops.decode_release(helm_release(MANIFEST))['name'], 'nvr')
+
+    def test_scanner_agrees_with_a_reference_and_with_tiny_chunks(self):
+        import random
+
+        def reference(raw):
+            values, depth, deepest, in_str, i = 0, 0, 0, False, 0
+            while i < len(raw):
+                c = raw[i]
+                if c == 0x5c and (in_str or raw[i + 1:i + 2] in (b'\\', b'"')):
+                    i += 2
+                    continue
+                if in_str:
+                    in_str = c != 0x22
+                elif c == 0x22:
+                    in_str = True
+                elif c in b',:':
+                    values += 1
+                elif c in b'{[':
+                    values += 1
+                    depth += 1
+                    deepest = max(deepest, depth)
+                elif c in b'}]':
+                    values += 1
+                    depth -= 1
+                i += 1
+            return values, deepest
+
+        rnd = random.Random(11)
+        alphabet = [b'"', b'\\', b'[', b']', b'{', b'}', b',', b':', b'a', b' ']
+        saved = inspect_ops._SCAN_CHUNK
+        try:
+            for chunk in (1, 2, 3, 7, saved):
+                inspect_ops._SCAN_CHUNK = chunk
+                for _ in range(1500):
+                    raw = b''.join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 40)))
+                    values, deepest = reference(raw)
+                    self.assertEqual(inspect_ops.json_scan(raw, values) == 'values', False, (chunk, raw))
+                    if values:
+                        self.assertEqual(inspect_ops.json_scan(raw, values - 1) == 'values', True, (chunk, raw))
+                    self.assertEqual(inspect_ops.json_too_deep(raw, deepest), False, (chunk, raw))
+                    if deepest:
+                        self.assertEqual(inspect_ops.json_too_deep(raw, deepest - 1), True, (chunk, raw))
+        finally:
+            inspect_ops._SCAN_CHUNK = saved
+
+    def test_utf16_record_cannot_skip_the_depth_check(self):
+        deep = '{"name":"nvr","namespace":"teknoir-demo","version":3,"manifest":"","x":%s%s}' % (
+            '[' * 5000, ']' * 5000)
+        # a lone U+0122 is the bytes 22 01: the byte scan reads a quote and takes the brackets after
+        # it for the inside of a string, while a UTF-16 sniffing json.loads would read them as brackets
+        skew = '["\u0122",' + '[' * 5000 + ']' * 5000 + ']'
+        calls = []
+        real_loads = inspect_ops.json.loads
+
+        def spy(doc, *a, **k):
+            calls.append(type(doc))
+            return real_loads(doc, *a, **k)
+        inspect_ops.json.loads = spy
+        try:
+            for text in (deep, skew):
+                for codec in ('utf-16-le', 'utf-16', 'utf-16-be', 'utf-32-le'):
+                    data = self.record(text.encode(codec))
+                    with self.assertRaises(inspect_ops.Failure) as cm:
+                        inspect_ops.decode_release(data)
+                    self.assertIn(cm.exception.code, ('device_error', 'too_large'), codec)
+                    if text is skew:
+                        self.assertEqual(cm.exception.code, 'device_error', codec)
+        finally:
+            inspect_ops.json.loads = real_loads
+        self.assertNotIn(bytes, calls)
+        # the same text as UTF-8 is refused for its depth
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops.decode_release(self.record(deep.encode()))
+        self.assertEqual(cm.exception.code, 'too_large')
+        # device output (pod, events) is decoded the same way
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops._json(skew.encode('utf-16-le'))
+        self.assertEqual(cm.exception.code, 'device_error')
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops._json(b'[' * 5000 + b']' * 5000)
+        self.assertEqual(cm.exception.code, 'too_large')
+
+    def test_release_metadata_strings_are_capped(self):
+        long = 'x' * 5000
+        rel = {'name': 'nvr', 'namespace': 'teknoir-demo', 'version': 3, 'manifest': 'm',
+               'info': {'status': long, 'last_deployed': long},
+               'chart': {'metadata': {'name': long, 'version': long, 'appVersion': long}}}
+        kept = inspect_ops.decode_release(self.record(json.dumps(rel).encode()))
+        for key in ('status', 'last_deployed', 'chart', 'chartVersion', 'appVersion'):
+            self.assertEqual(kept[key], 'x' * inspect_ops.RELEASE_META_CAP, key)
+        self.assertEqual(inspect_ops.RELEASE_META_CAP, 256)
+        self.assertEqual((kept['name'], kept['manifest']), ('nvr', 'm'))
+        rel['info'] = {'status': 7, 'last_deployed': None}                  # not strings: left alone
+        kept = inspect_ops.decode_release(self.record(json.dumps(rel).encode()))
+        self.assertEqual((kept['status'], kept['last_deployed']), (7, None))
+
+    def test_manifest_failure_names_nothing_from_stderr(self):
+        secret = 'hunter2'
+        for rc, err in ((255, 'error: cannot unmarshal !!str %s into Go value' % secret),
+                        (255, 'ssh: connect to host x port 22: Connection refused %s' % secret),
+                        (255, '')):
+            f = inspect_ops.manifest_failure(err.encode(), rc)
+            self.assertEqual((f.code, f.message), ('unavailable', 'The ssh session to the robot ended.'))
+        f = inspect_ops.manifest_failure(b'access denied: device_offline (last seen 5m ago)', 255)
+        self.assertEqual(f.code, 'offline')
+        f = inspect_ops.manifest_failure(b'sudo: a password is required', 1)
+        self.assertEqual(f.code, 'device_error')
+        f = inspect_ops.manifest_failure(b'sudo: a password is required', 255)
+        self.assertEqual(f.code, 'device_error')
+
     def test_release_json_nested_too_deep_is_a_contract_error(self):
         rel = '{"name":"nvr","namespace":"teknoir-demo","version":3,"manifest":"","x":%s%s}' % (
             '[' * 300000, ']' * 300000)
@@ -1171,8 +1352,8 @@ class TestEndpoint(InspectHTTPBase):
 
     def test_pod_and_events_json_with_too_many_objects_is_too_large(self):
         # under the byte caps, but ~100 MiB once json.loads has built it: refused before parsing
-        pod = '[' + ','.join(['{}'] * (inspect_ops.POD_JSON_CONTAINERS + 10)) + ']'
-        events = '[' + ','.join(['{}'] * (inspect_ops.EVENTS_JSON_CONTAINERS + 10)) + ']'
+        pod = '[' + ','.join(['{}'] * (inspect_ops.POD_JSON_VALUES // 3 + 10)) + ']'
+        events = '[' + ','.join(['{}'] * (inspect_ops.EVENTS_JSON_VALUES // 3 + 10)) + ']'
         self.assertLess(len(pod), inspect_ops.POD_CAP)
         self.assertLess(len(events), inspect_ops.EVENTS_CAP)
         self.scenario({'ops': [{'match': 'get pod', 'stdout': pod}, {'match': 'get events', 'stdout': events}]})
@@ -1395,7 +1576,7 @@ class TestEndpoint(InspectHTTPBase):
     def test_release_pretty_printed_output_over_the_manifest_cap_is_fine_when_compact_is_under(self):
         # kubectl indents: the raw stdout may be 4x MANIFEST_CAP, only the compact JSON is capped
         pad = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'big'},
-               'data': {'k%d' % i: 'v' for i in range(100000)}}
+               'data': {'k%d' % i: 'v' * 20 for i in range(60000)}}     # 120000 values
         raw = kubectl_out(pad)
         compact = len(json.dumps(pad, separators=(',', ':')))
         self.assertGreater(len(raw), inspect_ops.MANIFEST_CAP)
@@ -1411,6 +1592,12 @@ class TestEndpoint(InspectHTTPBase):
         self.err(self.post(self.REL), 503, 'offline')
         self.release_scenario({'rc': 1, 'stderr': 'unable to recognize "STDIN": dial tcp: connection refused'})
         self.err(self.post(self.REL), 502, 'device_error')
+
+    def test_release_manifest_command_exit_255_does_not_copy_stderr(self):
+        self.release_scenario({'rc': 255, 'stderr': 'error: cannot unmarshal !!str hunter2 into Go value'})
+        error = self.err(self.post(self.REL), 503, 'unavailable')
+        self.assertEqual(error['message'], 'The ssh session to the robot ended.')
+        self.assertNotIn('hunter2', json.dumps(error))
 
     def test_release_with_an_empty_manifest_asks_kubectl_nothing(self):
         for manifest in ('', '  \n\t\n'):

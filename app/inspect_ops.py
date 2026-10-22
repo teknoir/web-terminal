@@ -28,6 +28,7 @@ import binascii
 import collections
 import concurrent.futures
 import hashlib
+import itertools
 import heapq
 import json
 import logging
@@ -87,11 +88,16 @@ MANIFEST_CAP = 2 * 1024 * 1024
 # the manifest cap; the objects are then measured as compact JSON against MANIFEST_CAP, which is how
 # the backend measures them.
 KUBECTL_OUT_CAP = 4 * MANIFEST_CAP
-RELEASE_JSON_CONTAINERS = 400000      # objects plus arrays in the decoded release JSON
+# json.loads builds an object per JSON value (a number, `{}`, `[]`, a key), so JSON text is bounded
+# by its byte cap and by the number of VALUES in it (json_scan: commas, colons and brackets outside
+# strings) before json parses it. Decoded release record:
+RELEASE_JSON_VALUES = 400000
 # Objects (after flattening Lists) and printed JSON values kubectl may return for one release; its
-# JSON text is bounded by KUBECTL_OUT_CAP and the count of `{` and `[` in it before json parses it.
+# JSON text is bounded by KUBECTL_OUT_CAP and the value count before json parses it.
 RELEASE_MAX_OBJECTS = 2000
-RELEASE_OBJECTS_CONTAINERS = 200000
+RELEASE_OBJECTS_VALUES = 200000
+# Release metadata strings (status, chart, versions, date) are cut to this many characters.
+RELEASE_META_CAP = 256
 MAX_LIST_DEPTH = 8
 # An object nested deeper than this is hidden (Kubernetes objects are shallow; the response is
 # serialized again, here and in the backend, and those recurse).
@@ -106,10 +112,9 @@ REDACT_BUDGET = 8.0
 MAX_RELEASE_JOBS = 2
 # Pod and events shaping jobs (fast, on their own worker thread so a release never delays them).
 MAX_LIGHT_JOBS = 4
-# json.loads builds ~65 bytes per object or array, and the caps allow a body of nothing but `{}`;
-# the number of `{` and `[` in the raw bytes (an upper bound) is checked before parsing.
-POD_JSON_CONTAINERS = 100000
-EVENTS_JSON_CONTAINERS = 200000
+# The caps allow a body of nothing but `{},`; the number of JSON values is checked before parsing.
+POD_JSON_VALUES = 200000
+EVENTS_JSON_VALUES = 400000
 # Wall-time budget of one pod or events shaping job.
 LIGHT_BUDGET = 5.0
 EVENTS_KEEP = 200
@@ -346,6 +351,18 @@ def classify_failure(stderr, rc, connection=False):
     return Failure('device_error', _first_line(text) or 'kubectl failed (exit %s).' % rc)
 
 
+def manifest_failure(stderr, rc):
+    """The Failure for a manifest command that ended at the ssh level (exit 255) or at sudo. Only the
+    hub's `access denied:` line and the sudo prompt are recognised; anything else gets a fixed
+    sentence, because stderr of that command may be kubectl's, which quotes document values."""
+    text = stderr.decode('utf-8', 'replace') if isinstance(stderr, bytes) else stderr
+    if rc == 255 and _DENIED_RE.search(text):
+        return classify_failure(text, rc)
+    if 'sudo: a password is required' in text:
+        return Failure('device_error', 'The device login user cannot run kubectl through sudo.')
+    return Failure('unavailable', 'The ssh session to the robot ended.')
+
+
 # --------------------------------------------------------------- result shaping
 
 def _pick(obj, keys):
@@ -442,7 +459,7 @@ def shape_events(doc, deadline=None):
 
 def shape_pod_json(raw, deadline=None):
     """Raw `kubectl get pod -o json` stdout -> the pruned pod. Runs on a worker thread."""
-    doc = _json(raw, POD_JSON_CONTAINERS)
+    doc = _json(raw, POD_JSON_VALUES)
     _check_budget(deadline)
     out = prune_pod(doc)
     _check_budget(deadline)
@@ -451,7 +468,7 @@ def shape_pod_json(raw, deadline=None):
 
 def shape_events_json(raw, deadline=None):
     """Raw `kubectl get events -o json` stdout -> the events result. Runs on a worker thread."""
-    doc = _json(raw, EVENTS_JSON_CONTAINERS)
+    doc = _json(raw, EVENTS_JSON_VALUES)
     _check_budget(deadline)
     return shape_events(doc, deadline)
 
@@ -504,38 +521,57 @@ def pick_revision(rows, wanted):
     return rows[0][0] if rows else None
 
 
-# A string token is `"` plus everything up to the next `"`, or up to the end when it never closes
-# (`"?`), so the pattern cannot fail once it has started: no backtracking, linear in the input. It
-# only works on text whose escapes were neutralised first (json_too_deep does that).
-_JSON_TOKEN = re.compile(rb'"[^"]*"?|([{}\[\]])')
+_STRING = re.compile(rb'"[^"]*"?')
+_NON_BRACKET = bytes(set(range(256)) - set(b'{}[]'))
+_STEP = [0] * 256
+_STEP[ord('{')] = _STEP[ord('[')] = 1
+_STEP[ord('}')] = _STEP[ord(']')] = -1
+_SCAN_CHUNK = 1 << 17
 
 
-def json_too_deep(raw, limit=JSON_MAX_DEPTH):
-    """True when the JSON text nests `{`/`[` deeper than `limit`. Linear in len(raw), never recurses.
-    Run before json.loads.
+def json_scan(raw, max_values=None, limit=JSON_MAX_DEPTH):
+    """One linear pass over JSON text before json.loads builds anything. Returns 'values' when it
+    holds more than `max_values` JSON values (counted as commas, colons and brackets outside strings:
+    what json.loads allocates an object for), 'deep' when `{`/`[` nest deeper than `limit`, else None.
+    Never recurses; memory stays at a few chunks beyond the input.
 
     The scan is a state machine (outside a string, inside a string, escape) whose state changes are
     done by C code only: (1) every backslash pair `\\\\` and then every escaped quote `\\"` is
     overwritten with filler of the same length (bytes.replace goes left to right without overlap, so
     a run of backslashes pairs up exactly as a JSON string reads it), which leaves no escape that can
-    end a string; (2) one regex pass takes each whole string (an unterminated one runs to the end) or
-    one bracket; (3) the brackets are counted with a depth counter that stops at the limit. A
-    regex of the shape `"[^"\\]*(?:\\.[^"\\]*)*"` instead backtracks quadratically on an unterminated
-    string, and a repeated `(?:\\.)` group costs ~60 bytes of heap per escape. An unterminated string
-    is not an error here: its bracket depth was checked up to that point and json.loads (or the
-    object-stream reader) rejects the text itself."""
+    end a string; (2) in chunks that are cut right after a closing quote (the parity of the quotes
+    tells the state), every whole string (an unterminated one runs to the end) is replaced by `""`
+    with a pattern that cannot backtrack, so the sub holds only one chunk of pieces; (3) the values
+    are counted and the brackets kept (bytes.translate), then the depth is the running sum of the
+    brackets. An unterminated string is not an error here: json.loads (or the object-stream reader)
+    rejects the text itself. A regex of the shape `"[^"\\]*(?:\\.[^"\\]*)*"` instead backtracks
+    quadratically on an unterminated string."""
     flat = raw.replace(b'\\\\', b'\0\0').replace(b'\\"', b'\0\0')
-    depth = 0
-    for bracket in _JSON_TOKEN.findall(flat):
-        if not bracket:
-            continue
-        if bracket in (b'{', b'['):
-            depth += 1
-            if depth > limit:
-                return True
-        else:
-            depth -= 1
-    return False
+    size, pos, values, brackets = len(flat), 0, 0, []
+    while pos < size:
+        end = min(pos + _SCAN_CHUNK, size)
+        if end < size and flat.count(b'"', pos, end) % 2:      # the cut is inside a string
+            nxt = flat.find(b'"', end)
+            end = size if nxt < 0 else nxt + 1
+        chunk = _STRING.sub(b'""', flat[pos:end])
+        pos = end
+        values += (chunk.count(b',') + chunk.count(b':') + chunk.count(b'{') + chunk.count(b'}')
+                   + chunk.count(b'[') + chunk.count(b']'))
+        if max_values is not None and values > max_values:
+            return 'values'
+        brackets.append(chunk.translate(None, _NON_BRACKET))
+    steps = itertools.accumulate(map(_STEP.__getitem__, b''.join(brackets)))
+    return 'deep' if max(steps, default=0) > limit else None
+
+
+def json_too_deep(raw, limit=JSON_MAX_DEPTH):
+    """True when the JSON text nests `{`/`[` deeper than `limit` (see json_scan)."""
+    return json_scan(raw, None, limit) == 'deep'
+
+
+def _cap_str(value):
+    """Release metadata that is shown as is: a string is cut to RELEASE_META_CAP characters."""
+    return value[:RELEASE_META_CAP] if isinstance(value, str) else value
 
 
 def decode_release(secret_b64):
@@ -553,14 +589,18 @@ def decode_release(secret_b64):
             raise Failure('device_error', 'The release record on the robot could not be decoded.')
         if len(blob) > RELEASE_JSON_CAP or d.unconsumed_tail:
             raise Failure('too_large', 'The release record is too large to read.')
-    # json.loads needs ~65 bytes per object or array: bound the count (an upper bound, braces inside
-    # strings count too) before building them, or 8 MiB of `{}` would take ~250 MiB.
-    if blob.count(b'{') + blob.count(b'[') > RELEASE_JSON_CONTAINERS:
-        raise Failure('too_large', 'The release record is too complex to read.')
-    if json_too_deep(blob):
+    # json.loads builds an object per JSON value (~65 bytes for each container): bound the number of
+    # values (not only containers: 8 MiB of `1,1,1,` is 4M of them) and the depth on the UTF-8 bytes,
+    # before anything is built. Decoded explicitly: json.loads(bytes) would sniff UTF-16/32 and read
+    # a text this scan saw as bytes of something else.
+    try:
+        text = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        raise Failure('device_error', 'The release record on the robot could not be decoded.')
+    if json_scan(blob, RELEASE_JSON_VALUES):
         raise Failure('too_large', 'The release record is too complex to read.')
     try:
-        rel = json.loads(blob)
+        rel = json.loads(text)
     except (RecursionError, MemoryError):          # deeply nested or huge: not a record to read
         raise Failure('too_large', 'The release record is too complex to read.')
     except ValueError:
@@ -573,8 +613,9 @@ def decode_release(secret_b64):
     manifest = rel.get('manifest')
     kept = {
         'name': rel.get('name'), 'namespace': rel.get('namespace'), 'version': rel.get('version'),
-        'status': info.get('status'), 'last_deployed': info.get('last_deployed'),
-        'chart': meta.get('name'), 'chartVersion': meta.get('version'), 'appVersion': meta.get('appVersion'),
+        'status': _cap_str(info.get('status')), 'last_deployed': _cap_str(info.get('last_deployed')),
+        'chart': _cap_str(meta.get('name')), 'chartVersion': _cap_str(meta.get('version')),
+        'appVersion': _cap_str(meta.get('appVersion')),
         'manifest': manifest if isinstance(manifest, str) else '',
     }
     return kept
@@ -643,9 +684,7 @@ def parse_object_stream(raw, deadline=None):
     """The JSON values kubectl printed, in order: one object, a v1 List, or several objects one after
     the other (what `kubectl create -o json` prints for a multi-document input). Returns
     (values, complete); `complete` is False when something after the last value is not JSON."""
-    if raw.count(b'{') + raw.count(b'[') > RELEASE_OBJECTS_CONTAINERS:
-        raise Failure('too_large', 'The release is too complex to read.')
-    if json_too_deep(raw):
+    if json_scan(raw, RELEASE_OBJECTS_VALUES):
         raise Failure('too_large', 'The release is too complex to read.')
     text = raw.decode('utf-8', 'replace')
     decoder = json.JSONDecoder()
@@ -1122,7 +1161,7 @@ class InspectRunner:
             if over:
                 raise Failure('too_large', 'The rendered manifest is too large to read.')
             if rc == 255 or b'sudo: a password is required' in err:
-                raise classify_failure(err, rc)
+                raise manifest_failure(err, rc)
         else:
             rc, out, err = 1, b'', b'error: no objects passed to create'
         result = await self._run_job(
@@ -1186,13 +1225,20 @@ class InspectRunner:
         self.light_pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _json(raw, max_containers=None):
-    """json.loads of device output. `max_containers` bounds the objects plus arrays (counted on the
-    raw bytes, an upper bound) before anything is built."""
-    if max_containers is not None and raw.count(b'{') + raw.count(b'[') > max_containers:
+def _json(raw, max_values=None):
+    """json.loads of device output, after json_scan bounded the number of values (and the depth)
+    on the UTF-8 bytes. `raw` is decoded as UTF-8 explicitly (no UTF-16/32 sniffing)."""
+    if isinstance(raw, str):
+        text, raw = raw, raw.encode('utf-8', 'replace')
+    else:
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            raise Failure('device_error', 'The device answered with something that is not JSON.')
+    if json_scan(raw, max_values):
         raise Failure('too_large', 'The device answered with something too complex to read.')
     try:
-        return json.loads(raw)
+        return json.loads(text)
     except (RecursionError, MemoryError):
         raise Failure('too_large', 'The device answered with something too large or too nested to read.')
     except ValueError:
