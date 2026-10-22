@@ -460,6 +460,8 @@ def decode_release(secret_b64):
         raise Failure('too_large', 'The release record is too complex to read.')
     try:
         rel = json.loads(blob)
+    except (RecursionError, MemoryError):          # deeply nested or huge: not a record to read
+        raise Failure('too_large', 'The release record is too complex to read.')
     except ValueError:
         raise Failure('device_error', 'The release record on the robot could not be decoded.')
     if not isinstance(rel, dict):
@@ -539,19 +541,34 @@ def _check_budget(deadline):
         raise Failure('too_large', 'The rendered manifest is too complex to read.')
 
 
-def _classify_document(body, deadline):
-    """Stream the YAML events of one document (nothing is composed, so memory stays flat) and
-    return _SECRET or _MAYBE when it must be loaded and redacted, None when it can pass as text.
+MAX_YAML_DEPTH = 64     # libyaml composes nested nodes by C recursion: a deeper document is never loaded
 
-    Sensitive: a top-level `kind` of Secret or ending in List, a `kind` that is not a plain
-    scalar, a merge key or an alias/complex key at the top level (any of them could bring in
-    a kind), and more than one YAML document. A YAML error raises yaml.YAMLError."""
+
+def _classify_document(body, deadline):
+    """Stream the YAML events of one document (nothing is composed, so memory and the C stack
+    stay flat) and return (mode, deepest) where mode is _SECRET or _MAYBE when it must be loaded
+    and redacted, None when it can pass as text, and deepest is the greatest nesting seen. The
+    stream is always read to the end, because the nesting decides whether loading is safe.
+
+    Sensitive: a top-level `kind` of Secret or ending in List, a `kind` or a top-level key that is
+    not a plain untagged scalar (a tag like !!binary can make Kubernetes read it as `Secret`), a
+    merge key or an alias/complex key at the top level (any of them could bring in a kind), and
+    more than one YAML document. A YAML error raises yaml.YAMLError."""
     depth = 0
+    deepest = 0
+    mode = None
     root_map = False
+    skip_root = False                          # a scalar or sequence document is not a Secret
     expect_key = True
     key = None
     count = 0
     documents = 0
+
+    def raise_to(new):
+        nonlocal mode
+        if mode != _SECRET:
+            mode = new
+
     for ev in yaml.parse(body, Loader=_YAML_LOADER):
         count += 1
         if not count & 0x3FF:
@@ -559,7 +576,7 @@ def _classify_document(body, deadline):
         if isinstance(ev, yaml.DocumentStartEvent):
             documents += 1
             if documents > 1:
-                return _MAYBE
+                raise_to(_MAYBE)
             continue
         if isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
             depth -= 1
@@ -572,25 +589,47 @@ def _classify_document(body, deadline):
         is_start = isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent))
         if depth == 0:
             if not isinstance(ev, yaml.MappingStartEvent):
-                return None                    # a scalar or sequence document is not a Secret
-            root_map = True
-        elif depth == 1 and root_map:
+                skip_root = True
+            else:
+                root_map = True
+        elif depth == 1 and root_map and not skip_root:
             if expect_key:
-                if not isinstance(ev, yaml.ScalarEvent) or ev.value == '<<':
-                    return _MAYBE
+                if not isinstance(ev, yaml.ScalarEvent) or ev.value == '<<' or ev.tag is not None:
+                    raise_to(_MAYBE)
                 key = ev.value
             elif key == 'kind':
-                if not isinstance(ev, yaml.ScalarEvent):
-                    return _MAYBE
-                if ev.value == 'Secret':
-                    return _SECRET
-                if ev.value.endswith('List'):
-                    return _MAYBE
+                if not isinstance(ev, yaml.ScalarEvent) or ev.tag is not None:
+                    raise_to(_MAYBE)
+                elif ev.value == 'Secret':
+                    mode = _SECRET
+                elif ev.value.endswith('List'):
+                    raise_to(_MAYBE)
         if is_start:
             depth += 1
+            deepest = max(deepest, depth)
         elif depth == 1:
             expect_key = not expect_key
-    return None
+    if skip_root and documents <= 1:
+        mode = None
+    return mode, deepest
+
+
+def _fail_closed(obj):
+    """True when the loaded document has a key or a `kind` that is not a plain string (a tag made
+    it bytes or something else): Kubernetes may read it as a Secret, this code cannot tell."""
+    if not isinstance(obj, dict):
+        return False
+    if any(not isinstance(k, str) for k in obj):
+        return True
+    if 'kind' in obj and not isinstance(obj['kind'], str):
+        return True
+    items = obj.get('items')
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and (any(not isinstance(k, str) for k in item)
+                                           or ('kind' in item and not isinstance(item['kind'], str))):
+                return True
+    return False
 
 
 def _iter_documents(manifest):
@@ -623,7 +662,7 @@ def redact_manifest(manifest, deadline=None):
             emit('\n'.join(comments))
             continue
         try:
-            mode = _classify_document(body, deadline)
+            mode, deepest = _classify_document(body, deadline)
         except Failure:
             raise
         except Exception:
@@ -635,12 +674,17 @@ def redact_manifest(manifest, deadline=None):
         if len(body) > SECRET_DOC_CAP or len(body.encode('utf-8')) > SECRET_DOC_CAP:
             emit('\n'.join(comments + ['# <hidden: document too large to redact>']))
             continue
+        if deepest > MAX_YAML_DEPTH:           # loading would recurse in C and can kill the process
+            emit('\n'.join(comments + ['# <hidden: document too deep to redact>']))
+            continue
         try:
             obj = yaml.load(body, Loader=_YAML_LOADER)
         except Exception:
             emit('\n'.join(comments + ['# <hidden: document could not be parsed>']))
             continue
-        if _redact_object(obj):
+        if _fail_closed(obj):
+            emit('\n'.join(comments + ['# <hidden: document could not be checked for Secrets>']))
+        elif _redact_object(obj):
             dumped = yaml.safe_dump(obj, sort_keys=False, default_flow_style=False, allow_unicode=True)
             emit('\n'.join(comments + [dumped.rstrip('\n')]))
         elif mode == _SECRET:
@@ -960,7 +1004,11 @@ class InspectRunner:
                               retry_after=5)
             self._jobs += 1
 
+        started = False
+
         def job():
+            nonlocal started
+            started = True                   # from here on the job's own `finally` gives the slot back
             try:
                 return shape_release(secret, rows, name, namespace, revision, budget=self.redact_budget)
             finally:
@@ -968,9 +1016,10 @@ class InspectRunner:
                     self._jobs -= 1
         try:
             return await loop.run_in_executor(self.pool, job)
-        except RuntimeError:                 # executor shut down: the job never ran
-            with self._jobs_lock:
-                self._jobs -= 1
+        except RuntimeError:
+            if not started:                  # executor shut down: the job never ran
+                with self._jobs_lock:
+                    self._jobs -= 1
             raise
 
     # -- housekeeping
@@ -1002,6 +1051,8 @@ class InspectRunner:
 def _json(raw):
     try:
         return json.loads(raw)
+    except (RecursionError, MemoryError):
+        raise Failure('too_large', 'The device answered with something too large or too nested to read.')
     except ValueError:
         raise Failure('device_error', 'The device answered with something that is not JSON.')
 

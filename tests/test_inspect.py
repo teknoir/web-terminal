@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 
@@ -554,6 +555,99 @@ class TestRelease(unittest.TestCase):
             self.assertNotIn('LEAK1', text, name)
             self.assertIn('# Source: x', text, name)
 
+    @staticmethod
+    def on_small_stack(fn, *args):
+        """Run fn on a thread with a 1 MiB stack, like the worker thread on python:alpine (musl);
+        a call that recurses in C then dies with SIGSEGV and takes the test run with it."""
+        box = {}
+
+        def run():
+            try:
+                box['value'] = fn(*args)
+            except BaseException as exc:          # noqa
+                box['error'] = exc
+        old = threading.stack_size(1 << 20)
+        try:
+            t = threading.Thread(target=run)
+            t.start()
+        finally:
+            threading.stack_size(old)
+        t.join()
+        if 'error' in box:
+            raise box['error']
+        return box['value']
+
+    def test_deeply_nested_documents_never_reach_the_c_loader(self):
+        for depth in (5000, 20000):
+            for name, doc in (
+                    ('secret', 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '[' * depth + ']' * depth + '\n'),
+                    ('list', 'kind: SecretList\nitems: ' + '[' * depth + ']' * depth + '\n'),
+                    ('kind last', 'x: ' + '[' * depth + ']' * depth + '\nkind: Secret\n'),
+                    ('maps', 'kind: Secret\nx: ' + '{a: ' * (depth // 5) + '1' + '}' * (depth // 5) + '\n')):
+                text = self.on_small_stack(inspect_ops.redact_manifest, '---\n# Source: x\n' + doc)
+                self.assertIn('# <hidden: document too deep to redact>', text, (name, depth))
+                self.assertIn('# Source: x', text)
+                self.assertNotIn('LEAK1', text)
+
+    def test_deep_documents_that_are_not_sensitive_pass_as_text(self):
+        doc = 'kind: ConfigMap\nx: ' + '[' * 20000 + ']' * 20000 + '\n'
+        text = self.on_small_stack(inspect_ops.redact_manifest, '---\n' + doc)
+        self.assertIn('kind: ConfigMap', text)
+        self.assertNotIn('too deep', text)
+
+    def test_moderate_nesting_is_still_redacted(self):
+        nested = 'x: ' + '[' * 30 + ']' * 30 + '\n'
+        text = self.on_small_stack(inspect_ops.redact_manifest, '---\nkind: Secret\ndata: {a: LEAK1}\n' + nested)
+        self.assertNotIn('LEAK1', text)
+        self.assertNotIn('too deep', text)
+
+    def test_deep_secret_in_a_release_is_survived(self):
+        doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '[' * 5000 + ']' * 5000 + '\n'
+        out = self.on_small_stack(
+            inspect_ops.shape_release, helm_release('---\n' + doc), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3)
+        self.assertNotIn('LEAK1', out['manifest'])
+        self.assertIn('too deep', out['manifest'])
+
+    def test_tagged_kind_and_keys_are_still_secrets(self):
+        # sigs.k8s.io/yaml decodes !!binary to a string, so Kubernetes reads all of these as Secrets
+        cases = {
+            'tagged kind': 'kind: !!binary U2VjcmV0\ndata: {password: LEAK1}\nstringData: {token: LEAK2}\n',
+            'tagged key': '!!binary a2luZA==: Secret\ndata: {password: LEAK1}\nstringData: {token: LEAK2}\n',
+            'tagged str kind': 'kind: !!str Secret\ndata: {password: LEAK1}\nstringData: {token: LEAK2}\n',
+            'tagged list kind': 'kind: List\nitems:\n- kind: !!binary U2VjcmV0\n  data: {password: LEAK1}\n'
+                                '  stringData: {token: LEAK2}\n',
+            'tagged list item key': 'kind: List\nitems:\n- !!binary a2luZA==: Secret\n  data: {password: LEAK1}\n'
+                                    '  stringData: {token: LEAK2}\n',
+            'tagged list kind of list': 'kind: !!binary U2VjcmV0TGlzdA==\nitems:\n- kind: Secret\n'
+                                        '  data: {password: LEAK1}\n  stringData: {token: LEAK2}\n',
+        }
+        for name, body in cases.items():
+            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
+            self.assertNotIn('LEAK1', text, name)
+            self.assertNotIn('LEAK2', text, name)
+            self.assertIn('# Source: x', text, name)
+
+    def test_loaded_document_with_a_non_string_kind_is_hidden(self):
+        # even when the classifier let it through, a non-string kind or key fails closed
+        for obj in ({b'kind': 'Secret'}, {'kind': b'Secret'}, {'kind': 'List', 'items': [{'kind': b'Secret'}]},
+                    {'kind': 'List', 'items': [{b'kind': 'Secret'}]}):
+            self.assertTrue(inspect_ops._fail_closed(obj), obj)
+        for obj in ({'kind': 'Secret'}, {'kind': 'List', 'items': [{'kind': 'Secret'}, 3]}, [b'x'], {}):
+            self.assertFalse(inspect_ops._fail_closed(obj), obj)
+
+    def test_release_json_nested_too_deep_is_a_contract_error(self):
+        rel = '{"name":"nvr","namespace":"teknoir-demo","version":3,"manifest":"","x":%s%s}' % (
+            '[' * 300000, ']' * 300000)
+        data = base64.b64encode(base64.b64encode(gzip.compress(rel.encode()))).decode()
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops.decode_release(data)
+        self.assertIn(cm.exception.code, ('too_large', 'device_error'))
+
+    def test_device_json_nested_too_deep_is_a_contract_error(self):
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops._json('[' * 300000 + ']' * 300000)
+        self.assertIn(cm.exception.code, ('too_large', 'device_error'))
+
     def test_plain_documents_pass_as_text_without_being_loaded(self):
         docs = ['kind: ConfigMap\ndata: {kind: Secret}\n',                  # nested kind is not the kind
                 'kind: Deployment\nspec:\n  kind: Secret\n',
@@ -883,6 +977,42 @@ class TestEndpoint(InspectHTTPBase):
         runner._jobs = 0
         self.assertEqual(self.body_of(self.post(body))['result']['revision'], 3)
         self.assertEqual(runner._jobs, 0)                # the count goes back down when the job ends
+
+    def test_release_job_count_returns_to_zero_when_a_job_raises(self):
+        self.scenario({'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+        ]})
+        runner = self.app.settings['inspect_runner']
+        body = {'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}
+        orig = inspect_ops.shape_release
+        try:
+            for exc in (RuntimeError('x'), RecursionError('deep'), MemoryError()):
+                def boom(*a, **k):
+                    raise exc
+                inspect_ops.shape_release = boom
+                for _ in range(3):
+                    self.assertEqual(self.post(body).code, 500)
+                    self.assertEqual(runner._jobs, 0, repr(exc))
+        finally:
+            inspect_ops.shape_release = orig
+        self.assertEqual(self.body_of(self.post(body))['result']['revision'], 3)
+        self.assertEqual(runner._jobs, 0)
+
+    def test_deeply_nested_release_json_does_not_erode_the_job_bound(self):
+        rel = '{"name":"nvr","namespace":"teknoir-demo","version":3,"manifest":"","x":%s%s}' % (
+            '[' * 300000, ']' * 300000)
+        data = base64.b64encode(base64.b64encode(gzip.compress(rel.encode()))).decode()
+        self.scenario({'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': data},
+        ]})
+        runner = self.app.settings['inspect_runner']
+        body = {'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}
+        for _ in range(3):
+            resp = self.post(body)
+            self.assertIn(resp.code, (413, 502), resp.body)
+            self.assertEqual(runner._jobs, 0)
 
     def test_release_op_oversized_body_gets_json_invalid(self):
         self.err(self.post(None, raw=json.dumps(dict(self.POD, pad='x' * 5000))), 400, 'invalid')
