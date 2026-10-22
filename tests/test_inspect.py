@@ -921,7 +921,7 @@ class TestRelease(unittest.TestCase):
             kept, manifest = self.decode(helm_release(MANIFEST, gz=gz))
             self.assertEqual(manifest, MANIFEST.encode())
             self.assertEqual(set(kept), {'name', 'namespace', 'version', 'status', 'last_deployed', 'chart',
-                                         'chartVersion', 'appVersion', 'manifest'})
+                                         'chartVersion', 'appVersion'})          # no manifest text is kept
             out = inspect_ops.shape_release_objects(kept, [(3, 'deployed'), (2, 'superseded'), (1, 'superseded')],
                                                     'nvr', 'teknoir-demo', 3, 0, KUBECTL_OK.encode(), b'')
             self.assertEqual(set(out), {'name', 'namespace', 'revision', 'status', 'chart', 'chartVersion',
@@ -1249,10 +1249,13 @@ class TestRelease(unittest.TestCase):
         self.assertEqual(inspect_ops.pick_revision([(5, 'failed'), (4, 'failed')], None), 5)   # else newest
 
 
-@unittest.skipUnless(sys.platform.startswith('linux'), 'ru_maxrss is in KiB on Linux only')
+@unittest.skipUnless(sys.platform.startswith('linux'), 'VmHWM is read from /proc/self/status')
 class TestPeakMemory(unittest.TestCase):
-    """Process peak (ru_maxrss) of the shaping jobs, one FRESH process per case (the peak of a
-    process never goes down, so cases cannot share one). Every string in every input holds one
+    """Process peak (VmHWM of /proc/self/status) of the shaping jobs, one FRESH process per case (the
+    peak of a process never goes down, so cases cannot share one). Not ru_maxrss: that mark is
+    inherited across fork+exec, so in the full suite (a big parent process) it hid every regression;
+    the probe also reports its own baseline and the test asserts it is a small fresh interpreter.
+    Every string in every input holds one
     non-BMP character: CPython then stores it at 4 bytes per character, and the decoded text, the
     parsed values and the bytes are alive together. Every input passes the value and depth scan,
     so the memory is spent before any size verdict. Peaks are MiB above the process right after
@@ -1270,18 +1273,27 @@ class TestPeakMemory(unittest.TestCase):
       decode_many       89.2   81.0 (100)      8 MiB record, 80000 small objects
       decode_values     40.5   15.8 (24)       refused on the value count before the text is built
       events            18.0   18.0 (40)
+      release_op        20.4   19.3 (28)       a whole release op with a 1.5 MiB manifest and one astral
+                                              character (see below for what it still holds)
 
+    release_op also measures what the op still references (tracemalloc) when the manifest goes to the
+    robot and when the shaping job starts: before 11.3 / 11.3 MiB (the record text, the secret and
+    the manifest as a 6 MiB str), after 1.5 (the manifest bytes being written) / 0.0.
     The cap of kubectl's stdout went from 8 MiB to 4 MiB (shape_*: the 8 MiB input needs 69-80 MiB
     even with the new code); RELEASE_JSON_CAP stays 8 MiB (decode_*: about 40 MiB of text plus
     values at the cap, in one job at a time)."""
 
     LIMITS = {'shape_single': 56, 'shape_long': 56, 'shape_many': 56, 'shape_objects': 56,
               'shape_ok': 40, 'decode_single': 100, 'decode_long': 100, 'decode_many': 100,
-              'decode_values': 24, 'events': 40}
+              'decode_values': 24, 'events': 40, 'release_op': 28}
+    BASELINE_LIMIT = 40          # a fresh interpreter with the imports is about 30 MiB
+    HELD_AT_MANIFEST_CALL = 3    # MiB; the manifest bytes (1.5) are what the call writes
+    HELD_AT_SHAPING = 1
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
+        cls.probed = {}
         cls.probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rss_probe.py')
         cls.app = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app')
 
@@ -1298,6 +1310,9 @@ class TestPeakMemory(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         result = json.loads(proc.stdout)
         self.assertEqual(result['outcome'], rss_probe.CASES[case], case)
+        # a mark inherited from a big parent would show here, not as a quiet pass
+        self.assertLess(result['baseline_mib'], self.BASELINE_LIMIT, (case, result))
+        self.probed[case] = result
         return result['peak_mib']
 
     def test_the_cases_and_limits_agree(self):
@@ -1308,6 +1323,21 @@ class TestPeakMemory(unittest.TestCase):
         peaks = {case: self.probe_case(case) for case in sorted(self.LIMITS)}
         for case, peak in peaks.items():
             self.assertLess(peak, self.LIMITS[case], (case, peaks))
+
+    def test_a_release_op_drops_the_record_and_the_manifest_text(self):
+        """End to end (list, secret, manifest, shaping), a manifest with one astral character (a str of
+        4 bytes per character): the secret, its text and the manifest str are not referenced while the
+        manifest goes to the robot and while the shaping job runs."""
+        peak = self.probe_case('release_op')
+        result = self.probed['release_op']
+        self.assertLess(peak, self.LIMITS['release_op'], result)
+        self.assertLess(result['held_at_manifest_call_mib'], self.HELD_AT_MANIFEST_CALL, result)
+        self.assertLess(result['held_at_shaping_mib'], self.HELD_AT_SHAPING, result)
+
+    def test_decode_checked_keeps_no_manifest_text(self):
+        kept, manifest = inspect_ops.decode_checked(helm_release(MANIFEST), 'nvr', 'teknoir-demo', 3)
+        self.assertNotIn('manifest', kept)
+        self.assertEqual(manifest, MANIFEST.encode())
 
     def test_kubectl_stdout_cap_is_4_mib(self):
         self.assertEqual(inspect_ops.KUBECTL_OUT_CAP, 4 * 1024 * 1024)

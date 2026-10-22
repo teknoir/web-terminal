@@ -828,14 +828,16 @@ def redact_objects(values, deadline=None):
 
 def decode_checked(secret_b64, name, namespace, revision, budget=REDACT_BUDGET):
     """Decode, check it is the release asked for, drop everything but the allowed fields. Returns
-    (kept, manifest bytes). Runs in a thread; `budget` is the wall time it may take."""
+    (kept, manifest bytes); the manifest text is NOT left in `kept` (as a str with one non-BMP
+    character it is 4 bytes per character, and nothing after this reads it: only the bytes go to the
+    robot). Runs in a thread; `budget` is the wall time it may take."""
     deadline = time.monotonic() + budget
     kept = decode_release(secret_b64)
     if (kept['name'], kept['namespace']) != (name, namespace) or not _is_int(kept['version']) \
             or kept['version'] != revision:
         raise Failure('device_error', 'The release record on the robot does not match the request.')
     try:
-        manifest = kept['manifest'].encode('utf-8')
+        manifest = kept.pop('manifest').encode('utf-8')
     except UnicodeEncodeError:
         raise Failure('device_error', 'The release record on the robot could not be decoded.')
     if len(manifest) > MANIFEST_CAP:
@@ -1217,23 +1219,31 @@ class InspectRunner:
                           % (req.fields['revision'], req.fields['release']))
         secret, _, _ = await self._kubectl(st, kubectl_argv(req, revision), RELEASE_SECRET_CAP)
         name, namespace, budget = req.fields['release'], req.namespace, self.redact_budget
-        text = secret.decode('ascii', 'replace')
+        secret_len = len(secret)
+        # The text goes to the job in a box the job empties, and `secret` and `text` are dropped
+        # here: nothing held by this frame or by a closure keeps a copy of the record (up to 3 MiB
+        # twice) through the kubectl call and the shaping job.
+        box = [secret.decode('ascii', 'replace')]
+        del secret
         kept, manifest = await self._run_job(
             self.pool, '_jobs', MAX_RELEASE_JOBS,
-            lambda: decode_checked(text, name, namespace, revision, budget=budget))
+            lambda: decode_checked(box.pop(), name, namespace, revision, budget=budget))
+        del box
         if manifest.strip():
             rc, out, err, over = await self._remote(st, kubectl_manifest_argv(req), KUBECTL_OUT_CAP,
                                                     stdin_data=manifest)
+            del manifest
             if over:
                 raise Failure('too_large', 'The rendered manifest is too large to read.')
             if rc == 255 or b'sudo: a password is required' in err:
                 raise manifest_failure(err, rc)
         else:
+            del manifest
             rc, out, err = 1, b'', b'error: no objects passed to create'
         result = await self._run_job(
             self.pool, '_jobs', MAX_RELEASE_JOBS,
             lambda: shape_release_objects(kept, rows, name, namespace, revision, rc, out, err, budget=budget))
-        return result, len(secret)
+        return result, secret_len
 
     async def _light_job(self, fn, raw):
         """Parse and shape pod or events JSON on the light worker thread, with the same kind of
