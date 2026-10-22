@@ -304,6 +304,8 @@ class TestStderrMapping(unittest.TestCase):
             ('Error from server (NotFound): pods "p" not found', 1, 'not_found', 404),
             ('Error from server (NotFound): namespaces "zz" not found', 1, 'not_found', 404),
             ('sudo: a password is required', 1, 'device_error', 502),
+            ('sudo: k3s: command not found', 1, 'device_error', 502),
+            ('bash: line 1: k3s: command not found', 127, 'device_error', 502),
             ('Error from server (Forbidden): pods is forbidden', 1, 'device_error', 502),
             ('', 1, 'device_error', 502),
         ]
@@ -441,6 +443,12 @@ class TestShaping(unittest.TestCase):
         self.assertTrue(out['truncated']['bytes'])
         self.assertLessEqual(out['bytes'], inspect_ops.LOG_LIMIT_BYTES)
 
+    def test_logs_binary_output_stays_within_contract(self):
+        out = inspect_ops.shape_logs(b'\xff' * (1 << 20), b'', self.req_logs(), False)
+        self.assertLessEqual(out['bytes'], inspect_ops.LOG_LIMIT_BYTES)
+        self.assertLessEqual(len(out['text'].encode('utf-8')), inspect_ops.LOG_LIMIT_BYTES)
+        self.assertTrue(out['truncated']['bytes'])
+
     def test_logs_invalid_utf8_replaced(self):
         out = inspect_ops.shape_logs(b'ok \xff\xfe\n', b'', self.req_logs(), False)
         self.assertIn('ok ', out['text'])
@@ -507,6 +515,29 @@ class TestRelease(unittest.TestCase):
             inspect_ops.decode_release(data)
         self.assertEqual(cm.exception.code, 'too_large')
 
+    def test_large_manifest_fails_fast_before_parsing(self):
+        # compressible and over the cap: must be refused without splitting or parsing it
+        doc = '---\nkind: ConfigMap\ndata:\n  k: "%s"\n' % ('x' * 1000)
+        manifest = doc * ((inspect_ops.MANIFEST_CAP // len(doc)) + 10)
+        data = helm_release(manifest)
+        self.assertLess(len(data), 200000)
+        orig = inspect_ops.redact_manifest
+
+        def boom(_):
+            raise AssertionError('manifest was parsed')
+        inspect_ops.redact_manifest = boom
+        try:
+            started = time.monotonic()
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                inspect_ops.shape_release(data, [(1, 'deployed')])
+        finally:
+            inspect_ops.redact_manifest = orig
+        self.assertEqual(cm.exception.code, 'too_large')
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_release_json_cap_is_8_mib(self):
+        self.assertEqual(inspect_ops.RELEASE_JSON_CAP, 8 * 1024 * 1024)
+
     def test_bad_encodings(self):
         for data in ('!!!notbase64', base64.b64encode(b'###').decode(),
                      base64.b64encode(base64.b64encode(b'not json')).decode(),
@@ -534,14 +565,35 @@ class TestPrincipalsAndXfcc(unittest.TestCase):
                          [PRINCIPAL, 'cluster.local/ns/a/sa/b'])
         self.assertEqual(inspect_ops.parse_principals('spiffe://x/ns/a/sa/b,cluster.local/ns/A/sa/b'), [])
 
-    def test_xfcc_last_element_only(self):
-        uris = inspect_ops.xfcc_uris(['URI=spiffe://evil/ns/x/sa/y,By=z;URI=spiffe://' + PRINCIPAL])
+    def test_xfcc_single_element(self):
+        uris = inspect_ops.xfcc_uris(['By=z;Hash=abc;Subject="CN=a,O=b";URI=spiffe://' + PRINCIPAL])
         self.assertEqual(uris, ['spiffe://' + PRINCIPAL])
-        uris = inspect_ops.xfcc_uris(['URI=spiffe://' + PRINCIPAL + ',URI=spiffe://evil/ns/x/sa/y'])
-        self.assertEqual(uris, ['spiffe://evil/ns/x/sa/y'])
         uris = inspect_ops.xfcc_uris(['Subject="CN=a,O=b;URI=spiffe://fake";URI=spiffe://real'])
         self.assertEqual(uris, ['spiffe://real'])
         self.assertEqual(inspect_ops.xfcc_uris([]), [])
+
+    def test_xfcc_fails_closed_on_forged_or_malformed(self):
+        envoy = ('By=spiffe://cluster.local/ns/teknoir-system/sa/wgt-abc;Hash=deadbeef;Subject="";'
+                 'URI=spiffe://cluster.local/ns/teknoir-demo/sa/attacker')
+        forged = 'URI=spiffe://' + PRINCIPAL
+        cases = [
+            # the reported bypass: an unclosed quote swallows the real URI of Envoy's element
+            [forged + ';x="', envoy],
+            [forged + ';x="' + ',' + envoy],
+            # a forged element before Envoy's, balanced or not
+            [forged, envoy],
+            [forged + ',' + envoy],
+            [forged + ';x="a"', envoy],
+            [envoy, forged],
+            # unbalanced or dangling-escape quotes alone
+            ['URI=spiffe://' + PRINCIPAL + ';x="'],
+            ['Subject="abc\\'],
+            # more than one element
+            ['URI=spiffe://' + PRINCIPAL + ',URI=spiffe://evil/ns/x/sa/y'],
+            ['URI=spiffe://evil/ns/x/sa/y,By=z;URI=spiffe://' + PRINCIPAL],
+        ]
+        for values in cases:
+            self.assertEqual(inspect_ops.xfcc_uris(values), [], values)
 
 
 class InspectHTTPBase(FakeSSHMixin, AsyncHTTPTestCase):
@@ -601,7 +653,9 @@ class TestEndpoint(InspectHTTPBase):
     def test_peer_check(self):
         for xfcc in (None, '', 'URI=spiffe://cluster.local/ns/teknoir-demo/sa/other',
                      'URI=spiffe://' + PRINCIPAL + ',URI=spiffe://cluster.local/ns/x/sa/y',
-                     'URI=' + PRINCIPAL, 'URI=spiffe://' + PRINCIPAL + 'x'):
+                     'URI=' + PRINCIPAL, 'URI=spiffe://' + PRINCIPAL + 'x',
+                     'URI=spiffe://' + PRINCIPAL + ';x="',
+                     'URI=spiffe://' + PRINCIPAL + ';x=",' + XFCC_OK):
             self.err(self.post(self.POD, xfcc=xfcc), 403, 'forbidden')
         self.assertEqual(self.calls(), [])
 
@@ -812,11 +866,12 @@ class TestMasters(InspectHTTPBase):
         os.unlink(os.path.join(alice_dir, 'cm'))           # ControlPersist expired
         self.io_loop.run_sync(runner.sweep)
         self.assertFalse(os.path.exists(alice_dir))
-        self.assertTrue(os.path.exists(runner._user_dir(BOB)))
+        bob_dir = runner._user_dir(BOB)
+        self.assertTrue(os.path.exists(bob_dir))
         self.assertEqual(list(runner.states), [BOB])
         self.io_loop.run_sync(runner.close)
         self.assertGreaterEqual(len(self.exit_calls()), 1)
-        self.assertFalse(os.path.exists(runner._user_dir(BOB)))
+        self.assertFalse(os.path.exists(bob_dir))
 
     def test_orphan_dirs_swept(self):
         runner = self.app.settings['inspect_runner']
@@ -923,16 +978,53 @@ class TestLimits(unittest.TestCase, FakeSSHMixin):
 
         async def go():
             r = self.runner(max_masters=3)
+            first_dir = None
             for u in users:
                 await r.execute(u, self.req())
+                if first_dir is None:
+                    first_dir = r._user_dir(u)
             states = list(r.states)
-            evicted_dir_exists = os.path.exists(r._user_dir(users[0]))
+            evicted_dir_exists = os.path.exists(first_dir)
             await r.close()
             return states, evicted_dir_exists
         states, exists = asyncio.run(go())
         self.assertEqual(states, users[1:])
         self.assertFalse(exists)
         self.assertGreaterEqual(len(self.exit_calls()), 1)
+
+    def test_evicted_users_late_cleanup_does_not_touch_their_new_state(self):
+        self.scenario({'ops': [{'match': 'get pod', 'stdout': '{"metadata":{}}'}]})
+        users = ['u%d@example.com' % i for i in range(3)]
+
+        async def go():
+            r = self.runner(max_masters=2)
+            await r.execute(users[0], self.req())
+            await r.execute(users[1], self.req())
+            old_dir = r._user_dir(users[0])
+            orig = r._close_state
+            gate = asyncio.Event()
+
+            async def slow_close(st):
+                await gate.wait()           # the eviction's cleanup is still running
+                await orig(st)
+            r._close_state = slow_close
+            evicting = asyncio.ensure_future(r.execute(users[2], self.req()))
+            await asyncio.sleep(0.1)
+            assert users[0] not in r.states
+            # the evicted user comes back while the old state is still being closed; make room
+            r.max_masters = 3
+            await r.execute(users[0], self.req())
+            new_dir = r.states[users[0]].dir
+            known_hosts_dir_ok = os.path.isdir(new_dir)
+            gate.set()
+            await evicting
+            result = (old_dir, new_dir, os.path.exists(old_dir), os.path.isdir(new_dir), known_hosts_dir_ok)
+            await r.close()
+            return result
+        old_dir, new_dir, old_exists, new_exists, _ = asyncio.run(go())
+        self.assertNotEqual(old_dir, new_dir)
+        self.assertFalse(old_exists)
+        self.assertTrue(new_exists, 'the late cleanup removed the successor state directory')
 
     def test_master_cap_all_busy(self):
         self.scenario({'ops': [{'match': 'get pod', 'sleep': 1.0, 'stdout': '{"metadata":{}}'}]})

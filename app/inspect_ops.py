@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import shlex
+import secrets
 import shutil
 import signal
 import time
@@ -71,7 +72,7 @@ POD_CAP = 1024 * 1024
 EVENTS_CAP = 2 * 1024 * 1024
 RELEASE_LIST_CAP = 64 * 1024
 RELEASE_SECRET_CAP = 3 * 1024 * 1024
-RELEASE_JSON_CAP = 32 * 1024 * 1024
+RELEASE_JSON_CAP = 8 * 1024 * 1024
 MANIFEST_CAP = 4 * 1024 * 1024
 EVENTS_KEEP = 200
 EVENT_MESSAGE_CAP = 1024
@@ -288,10 +289,10 @@ def classify_failure(stderr, rc, connection=False):
         return Failure('no_previous', 'The container has no previous run to read.')
     if re.search(r'is waiting to start|ContainerCreating|PodInitializing', text):
         return Failure('not_started', 'The container has not started yet.')
-    if re.search(r'NotFound|not found', text):
-        return Failure('not_found', 'Not found on the robot.')
     if 'sudo: a password is required' in text:
         return Failure('device_error', 'The device login user cannot run kubectl through sudo.')
+    if re.search(r'\(NotFound\)|"[^"\n]*" not found', text, re.M):
+        return Failure('not_found', 'Not found on the robot.')
     return Failure('device_error', _first_line(text) or 'kubectl failed (exit %s).' % rc)
 
 
@@ -385,7 +386,11 @@ def shape_logs(raw, stderr, req, over):
     cut = over or len(raw) >= LOG_LIMIT_BYTES
     if len(raw) > LOG_LIMIT_BYTES:
         raw = raw[:LOG_LIMIT_BYTES]
-    text = raw.decode('utf-8', 'replace')
+    text = raw.decode('utf-8', 'backslashreplace')
+    encoded = text.encode('utf-8')
+    if len(encoded) > LOG_LIMIT_BYTES:    # invalid bytes grow when escaped; keep the contract
+        text = encoded[:LOG_LIMIT_BYTES].decode('utf-8', 'ignore')
+        cut = True
     if cut and '\n' in text:
         text = text[:text.rindex('\n') + 1]   # drop the line the cap cut in half
     lines = text.count('\n') + (1 if text and not text.endswith('\n') else 0)
@@ -453,6 +458,8 @@ def decode_release(secret_b64):
     return kept
 
 
+_YAML_LOADER = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+
 _DOC_SPLIT = re.compile(r'^---[ \t\r]*$', re.M)
 _LAST_APPLIED = 'kubectl.kubernetes.io/last-applied-configuration'
 
@@ -508,7 +515,7 @@ def redact_manifest(manifest):
             out.append('\n'.join(comments))
             continue
         try:
-            obj = yaml.safe_load(body)
+            obj = yaml.load(body, Loader=_YAML_LOADER)
         except Exception:
             out.append('\n'.join(comments + ['# <hidden: document could not be parsed>']))
             continue
@@ -526,6 +533,8 @@ def redact_manifest(manifest):
 def shape_release(secret_b64, rows):
     """Decode, drop everything but the allowed fields, redact. Runs in a thread."""
     kept = decode_release(secret_b64)
+    if len(kept['manifest'].encode('utf-8')) > MANIFEST_CAP:     # before any splitting or parsing
+        raise Failure('too_large', 'The rendered manifest is too large to read.')
     manifest = redact_manifest(kept['manifest'])
     history = [{'revision': v, 'status': s} for v, s in rows[:HISTORY_KEEP]]
     result = {
@@ -602,12 +611,19 @@ class InspectRunner:
         self.clock = clock
         self.global_sem = asyncio.Semaphore(max_concurrent)
         self.states = collections.OrderedDict()
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix='inspect')
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='inspect')
 
     # -- per-user state
 
     def _user_dir(self, email):
-        return os.path.join(self.base_dir, 'u-' + hashlib.sha256(email.encode()).hexdigest()[:16])
+        """The live state's directory; a fresh unique one when the user has no state.
+        Every state gets its own directory (hash plus random suffix), so a late cleanup of an
+        evicted state can never touch the directory of its successor."""
+        st = self.states.get(email)
+        if st is not None:
+            return st.dir
+        return os.path.join(self.base_dir, 'u-%s-%s' % (hashlib.sha256(email.encode()).hexdigest()[:16],
+                                                       secrets.token_hex(4)))
 
     async def _acquire_state(self, email):
         """The user's state with `active` already incremented (so it is not evicted)."""
@@ -837,6 +853,8 @@ def _json(raw):
 # --------------------------------------------------------------------- HTTP
 
 def _split_quoted(text, sep):
+    """Split on `sep` outside double quotes. Returns (parts, balanced); `balanced` is False
+    when a quote is left open or ends in a dangling escape."""
     parts, cur, quoted, escaped = [], [], False, False
     for ch in text:
         if escaped:
@@ -854,16 +872,25 @@ def _split_quoted(text, sep):
         else:
             cur.append(ch)
     parts.append(''.join(cur))
-    return parts
+    return parts, not quoted and not escaped
 
 
 def xfcc_uris(values):
-    """URI entries of the last element of the X-Forwarded-Client-Cert header(s)."""
-    elements = [e for e in _split_quoted(','.join(values), ',') if e.strip()]
-    if not elements:
+    """URI entries of the X-Forwarded-Client-Cert header, or [] (fail closed) unless the
+    joined header is exactly one element with balanced quotes. Istio appends Envoy's element
+    to whatever the caller sent, and the backend never sends one, so a real request carries
+    only Envoy's element; anything else is forged or malformed."""
+    elements, balanced = _split_quoted(','.join(values), ',')
+    if not balanced:
+        return []
+    elements = [e for e in elements if e.strip()]
+    if len(elements) != 1:
+        return []
+    pairs, balanced = _split_quoted(elements[0], ';')
+    if not balanced:
         return []
     uris = []
-    for pair in _split_quoted(elements[-1], ';'):
+    for pair in pairs:
         key, _, value = pair.strip().partition('=')
         if key.lower() == 'uri':
             uris.append(value.strip().strip('"'))
@@ -892,7 +919,7 @@ class _JsonHandler(tornado.web.RequestHandler):
 
     def send_json(self, status, payload):
         self.set_status(status)
-        self.finish(json.dumps(payload, separators=(',', ':')))
+        self.finish(json.dumps(payload, separators=(',', ':'), ensure_ascii=False))
 
     def send_error_body(self, failure):
         err = {'code': failure.code, 'message': failure.message}
@@ -904,7 +931,7 @@ class _JsonHandler(tornado.web.RequestHandler):
         code = {404: 'not_found', 401: 'no_user', 403: 'forbidden'}.get(status_code,
                                                                        'invalid' if status_code < 500 else 'internal')
         self.set_status(status_code)
-        self.finish(json.dumps({'v': WIRE_VERSION, 'error': {'code': code, 'message': self._reason}}))
+        self.finish(json.dumps({'v': WIRE_VERSION, 'error': {'code': code, 'message': self._reason}}, ensure_ascii=False))
 
 
 class NotFoundHandler(_JsonHandler):
