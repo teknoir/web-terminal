@@ -26,6 +26,7 @@ import binascii
 import collections
 import concurrent.futures
 import hashlib
+import heapq
 import io
 import json
 import logging
@@ -80,7 +81,8 @@ RELEASE_SECRET_CAP = 3 * 1024 * 1024
 # Spec 3.4/3.6 said 32 MiB; json.loads of a 32 MiB document of small objects would need several
 # hundred MiB and the container has 256Mi, so the decoded release is capped at 8 MiB.
 RELEASE_JSON_CAP = 8 * 1024 * 1024
-MANIFEST_CAP = 4 * 1024 * 1024
+# The backend refuses a manifest over 2 MiB (RELEASE_MAX_MANIFEST_BYTES), so the pod stops there too.
+MANIFEST_CAP = 2 * 1024 * 1024
 RELEASE_JSON_CONTAINERS = 400000      # objects plus arrays in the decoded release JSON
 # Only Secret and *List documents are ever built into objects, and only up to this size (a bigger
 # one is replaced by a placeholder instead of being redacted); everything else is scanned as events.
@@ -89,6 +91,14 @@ SECRET_DOC_CAP = 256 * 1024
 REDACT_BUDGET = 8.0
 # Release shaping jobs that may exist at once (one running plus one waiting).
 MAX_RELEASE_JOBS = 2
+# Pod and events shaping jobs (fast, on their own worker thread so a release never delays them).
+MAX_LIGHT_JOBS = 4
+# json.loads builds ~65 bytes per object or array, and the caps allow a body of nothing but `{}`;
+# the number of `{` and `[` in the raw bytes (an upper bound) is checked before parsing.
+POD_JSON_CONTAINERS = 100000
+EVENTS_JSON_CONTAINERS = 200000
+# Wall-time budget of one pod or events shaping job.
+LIGHT_BUDGET = 5.0
 EVENTS_KEEP = 200
 EVENT_MESSAGE_CAP = 1024
 HISTORY_KEEP = 20
@@ -367,28 +377,58 @@ def prune_pod(pod):
     return {'metadata': meta, 'spec': spec, 'status': status}
 
 
-def shape_events(doc):
+def shape_events(doc, deadline=None):
+    """Newest EVENTS_KEEP events, oldest first. Only a bounded heap of finished rows is kept while
+    iterating (a row is built only when it can still make the cut), so a huge item list never
+    becomes a huge row list."""
     if not isinstance(doc, dict):
         raise Failure('device_error', 'The device answered with something that is not an event list.')
-    rows = []
-    for e in _as_list(doc.get('items')):
+    heap = []                                  # (last, index, row): the smallest is the first to go
+    total = 0
+    for i, e in enumerate(_as_list(doc.get('items'))):
+        if not i & 0x3FF:
+            _check_budget(deadline)
         if not isinstance(e, dict):
             continue
+        total += 1
         series = e.get('series') if isinstance(e.get('series'), dict) else {}
+        last = e.get('lastTimestamp') or series.get('lastObservedTime') or e.get('eventTime')
+        key = (str(last or ''), i)
+        if len(heap) >= EVENTS_KEEP and key <= heap[0][:2]:
+            continue
         source = e.get('source') if isinstance(e.get('source'), dict) else {}
         message = e.get('message')
-        rows.append({
+        row = {
             'type': e.get('type'),
             'reason': e.get('reason'),
             'message': message[:EVENT_MESSAGE_CAP] if isinstance(message, str) else message,
             'count': e.get('count') or series.get('count'),
             'first': e.get('firstTimestamp') or e.get('eventTime'),
-            'last': e.get('lastTimestamp') or series.get('lastObservedTime') or e.get('eventTime'),
+            'last': last,
             'source': source.get('component') or e.get('reportingController'),
-        })
-    rows.sort(key=lambda r: str(r['last'] or ''))
-    truncated = len(rows) > EVENTS_KEEP
-    return {'events': rows[-EVENTS_KEEP:], 'truncated': truncated}
+        }
+        if len(heap) >= EVENTS_KEEP:
+            heapq.heappushpop(heap, (key[0], key[1], row))
+        else:
+            heapq.heappush(heap, (key[0], key[1], row))
+    heap.sort(key=lambda t: t[:2])
+    return {'events': [t[2] for t in heap], 'truncated': total > EVENTS_KEEP}
+
+
+def shape_pod_json(raw, deadline=None):
+    """Raw `kubectl get pod -o json` stdout -> the pruned pod. Runs on a worker thread."""
+    doc = _json(raw, POD_JSON_CONTAINERS)
+    _check_budget(deadline)
+    out = prune_pod(doc)
+    _check_budget(deadline)
+    return out
+
+
+def shape_events_json(raw, deadline=None):
+    """Raw `kubectl get events -o json` stdout -> the events result. Runs on a worker thread."""
+    doc = _json(raw, EVENTS_JSON_CONTAINERS)
+    _check_budget(deadline)
+    return shape_events(doc, deadline)
 
 
 _DEFAULTED_RE = re.compile(r'Defaulted container "([^"]+)"')
@@ -497,23 +537,6 @@ def _redact_secret(obj):
         meta['annotations'][_LAST_APPLIED] = HIDDEN
 
 
-def _redact_object(obj):
-    """Hide Secret values in place; True when anything was a Secret."""
-    if not isinstance(obj, dict):
-        return False
-    kind = obj.get('kind')
-    if kind == 'Secret':
-        _redact_secret(obj)
-        return True
-    found = False
-    if isinstance(kind, str) and kind.endswith('List') and isinstance(obj.get('items'), list):
-        for item in obj['items']:
-            if isinstance(item, dict) and item.get('kind') == 'Secret':
-                _redact_secret(item)
-                found = True
-    return found
-
-
 def _split_comments(text):
     """(leading comment lines, rest) of one manifest document. Walks the text by index so a
     document of millions of tiny lines is never split into a list."""
@@ -532,43 +555,53 @@ def _split_comments(text):
     return comments, text[pos:] if pos < n else ''
 
 
-_SECRET = 'secret'      # the text has a scalar `kind: Secret`
-_MAYBE = 'maybe'        # something that could produce a Secret or a list of them
+_SECRET = 'secret'      # a plain mapping of kind Secret: loaded, its values hidden
+_SHOW = 'show'          # a plain mapping of another kind: passed through as text
 
 
 def _check_budget(deadline):
     if deadline is not None and time.monotonic() > deadline:
-        raise Failure('too_large', 'The rendered manifest is too complex to read.')
+        raise Failure('too_large', 'This is too complex to read within the time limit.')
 
 
 MAX_YAML_DEPTH = 64     # libyaml composes nested nodes by C recursion: a deeper document is never loaded
+_RESOLVER = yaml.resolver.Resolver()
+_STR_TAG = 'tag:yaml.org,2002:str'
+
+
+def _is_plain_string(ev):
+    """True when the scalar event is a string without any tag (quoted, or plain text that YAML
+    does not read as a number, bool, null ...)."""
+    if ev.tag is not None:
+        return False
+    return _RESOLVER.resolve(yaml.ScalarNode, ev.value, ev.implicit) == _STR_TAG
+
+
+def _hide(reason):
+    return None, reason, 0
 
 
 def _classify_document(body, deadline):
     """Stream the YAML events of one document (nothing is composed, so memory and the C stack
-    stay flat) and return (mode, deepest) where mode is _SECRET or _MAYBE when it must be loaded
-    and redacted, None when it can pass as text, and deepest is the greatest nesting seen. The
-    stream is always read to the end, because the nesting decides whether loading is safe.
+    stay flat) and decide, failing closed, what may be shown. Returns (verdict, reason, deepest):
+    verdict is _SECRET (load it and hide its values), _SHOW (pass the text through) or None
+    (hide the whole document, `reason` says why). `deepest` is the nesting seen for a document
+    that is not hidden (the whole stream is read, because nesting decides whether loading is safe).
 
-    Sensitive: a top-level `kind` of Secret or ending in List, a `kind` or a top-level key that is
-    not a plain untagged scalar (a tag like !!binary can make Kubernetes read it as `Secret`), a
-    merge key or an alias/complex key at the top level (any of them could bring in a kind), and
-    more than one YAML document. A YAML error raises yaml.YAMLError."""
+    Shown or redacted only: a plain mapping (exactly one YAML document) with a plain string `kind`
+    that is not repeated and does not end in List, and no top-level `items` key. Hidden whole:
+    any anchor, alias, merge key (`<<`) or tag anywhere, a list directly inside a list, a top-level
+    key that is not a plain string, a `kind` that is not a plain string, a top-level key that is
+    `kind` or `items` in other letter case, and anything that does not parse. A YAML error raises
+    yaml.YAMLError (the caller hides the document)."""
     depth = 0
     deepest = 0
-    mode = None
-    root_map = False
-    skip_root = False                          # a scalar or sequence document is not a Secret
+    stack = []                                 # 'map' / 'seq' of the open collections
+    documents = 0
     expect_key = True
     key = None
+    kind = None
     count = 0
-    documents = 0
-
-    def raise_to(new):
-        nonlocal mode
-        if mode != _SECRET:
-            mode = new
-
     for ev in yaml.parse(body, Loader=_YAML_LOADER):
         count += 1
         if not count & 0x3FF:
@@ -576,60 +609,68 @@ def _classify_document(body, deadline):
         if isinstance(ev, yaml.DocumentStartEvent):
             documents += 1
             if documents > 1:
-                raise_to(_MAYBE)
+                return _hide('document has more than one YAML document')
             continue
         if isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
             depth -= 1
+            stack.pop()
             if depth == 1:
                 expect_key = not expect_key
             continue
         if not isinstance(ev, (yaml.ScalarEvent, yaml.AliasEvent, yaml.MappingStartEvent,
                                yaml.SequenceStartEvent)):
             continue                           # stream/document markers
-        is_start = isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent))
+        if isinstance(ev, yaml.AliasEvent) or ev.anchor is not None:
+            return _hide('document uses a YAML anchor or alias')
+        if ev.tag is not None:
+            return _hide('document uses a YAML tag')
+        is_scalar = isinstance(ev, yaml.ScalarEvent)
+        if is_scalar and ev.value == '<<':
+            return _hide('document uses a YAML merge key')
+        if isinstance(ev, yaml.SequenceStartEvent) and stack and stack[-1] == 'seq':
+            return _hide('document has nested lists')
         if depth == 0:
             if not isinstance(ev, yaml.MappingStartEvent):
-                skip_root = True
-            else:
-                root_map = True
-        elif depth == 1 and root_map and not skip_root:
+                return _hide('document is not a mapping')
+        elif depth == 1:
             if expect_key:
-                if not isinstance(ev, yaml.ScalarEvent) or ev.value == '<<' or ev.tag is not None:
-                    raise_to(_MAYBE)
+                if not is_scalar or not _is_plain_string(ev):
+                    return _hide('document has a key that is not a plain string')
                 key = ev.value
+                lowered = key.lower()
+                if lowered == 'items':
+                    return _hide('document has a top-level items key')
+                if lowered == 'kind':
+                    if key != 'kind' or kind is not None:
+                        return _hide('document has an odd or repeated kind key')
             elif key == 'kind':
-                if not isinstance(ev, yaml.ScalarEvent) or ev.tag is not None:
-                    raise_to(_MAYBE)
-                elif ev.value == 'Secret':
-                    mode = _SECRET
-                elif ev.value.endswith('List'):
-                    raise_to(_MAYBE)
-        if is_start:
+                if not is_scalar or not _is_plain_string(ev):
+                    return _hide('document has a kind that is not a plain string')
+                kind = ev.value
+        if not is_scalar:
             depth += 1
             deepest = max(deepest, depth)
+            stack.append('map' if isinstance(ev, yaml.MappingStartEvent) else 'seq')
         elif depth == 1:
             expect_key = not expect_key
-    if skip_root and documents <= 1:
-        mode = None
-    return mode, deepest
+    if documents != 1:
+        return _hide('document is not a mapping')
+    if kind is None:
+        return _hide('document has no kind')
+    lowered = kind.lower()
+    if lowered.endswith('list'):
+        return _hide('document is a list kind')
+    return (_SECRET if lowered == 'secret' else _SHOW), None, deepest
 
 
 def _fail_closed(obj):
-    """True when the loaded document has a key or a `kind` that is not a plain string (a tag made
-    it bytes or something else): Kubernetes may read it as a Secret, this code cannot tell."""
+    """True when a loaded document is not a mapping with only string keys and a string `kind`.
+    The event scan already guarantees it; this is the second check on what was really built."""
     if not isinstance(obj, dict):
-        return False
+        return True
     if any(not isinstance(k, str) for k in obj):
         return True
-    if 'kind' in obj and not isinstance(obj['kind'], str):
-        return True
-    items = obj.get('items')
-    if isinstance(items, list):
-        for item in items:
-            if isinstance(item, dict) and (any(not isinstance(k, str) for k in item)
-                                           or ('kind' in item and not isinstance(item['kind'], str))):
-                return True
-    return False
+    return not isinstance(obj.get('kind'), str)
 
 
 def _iter_documents(manifest):
@@ -662,13 +703,16 @@ def redact_manifest(manifest, deadline=None):
             emit('\n'.join(comments))
             continue
         try:
-            mode, deepest = _classify_document(body, deadline)
+            mode, reason, deepest = _classify_document(body, deadline)
         except Failure:
             raise
         except Exception:
             emit('\n'.join(comments + ['# <hidden: document could not be parsed>']))
             continue
-        if not mode:
+        if mode is None:
+            emit('\n'.join(comments + ['# <hidden: %s>' % reason]))
+            continue
+        if mode == _SHOW:
             emit(chunk.strip('\n'))
             continue
         if len(body) > SECRET_DOC_CAP or len(body.encode('utf-8')) > SECRET_DOC_CAP:
@@ -682,17 +726,14 @@ def redact_manifest(manifest, deadline=None):
         except Exception:
             emit('\n'.join(comments + ['# <hidden: document could not be parsed>']))
             continue
-        if _fail_closed(obj):
+        if _fail_closed(obj) or str(obj['kind']).lower() != 'secret':
             emit('\n'.join(comments + ['# <hidden: document could not be checked for Secrets>']))
-        elif _redact_object(obj):
-            dumped = yaml.safe_dump(obj, sort_keys=False, default_flow_style=False, allow_unicode=True)
-            emit('\n'.join(comments + [dumped.rstrip('\n')]))
-        elif mode == _SECRET:
-            # A scalar `kind: Secret` was in the text but the loaded document is not one (a later
-            # duplicate key won): do not trust the parse, show nothing of it.
-            emit('\n'.join(comments + ['# <hidden: document could not be read as a Secret>']))
-        else:
-            emit(chunk.strip('\n'))
+            continue
+        # No anchors or aliases exist (the scan refused them), so nothing is shared between the
+        # values that are hidden and the rest of the document and the dump cannot bring it back.
+        _redact_secret(obj)
+        dumped = yaml.safe_dump(obj, sort_keys=False, default_flow_style=False, allow_unicode=True)
+        emit('\n'.join(comments + [dumped.rstrip('\n')]))
     text = out.getvalue()
     if len(text.encode('utf-8')) > MANIFEST_CAP:
         raise Failure('too_large', 'The rendered manifest is too large to read.')
@@ -784,11 +825,13 @@ class InspectRunner:
         self.rate_per_min = rate_per_min
         self.clock = clock
         self.redact_budget = redact_budget
-        self._jobs = 0
+        self._jobs = 0                       # release jobs queued or running
+        self._light_jobs = 0                 # pod and events jobs queued or running
         self._jobs_lock = threading.Lock()
         self.global_sem = asyncio.Semaphore(max_concurrent)
         self.states = collections.OrderedDict()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='inspect')
+        self.light_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='inspect-light')
 
     # -- per-user state
 
@@ -973,10 +1016,11 @@ class InspectRunner:
         loop = asyncio.get_running_loop()
         if req.op == 'pod':
             out, _, _ = await self._kubectl(st, kubectl_argv(req), POD_CAP)
-            return {'pod': prune_pod(_json(out))}, len(out)
+            pod = await self._light_job(shape_pod_json, out)
+            return {'pod': pod}, len(out)
         if req.op == 'events':
             out, _, _ = await self._kubectl(st, kubectl_argv(req), EVENTS_CAP)
-            return shape_events(_json(out)), len(out)
+            return await self._light_job(shape_events_json, out), len(out)
         if req.op == 'logs':
             out, err, over = await self._kubectl(st, kubectl_argv(req), LOG_READ_CAP, allow_over=True)
             return shape_logs(out, err, req, over), len(out)
@@ -998,29 +1042,39 @@ class InspectRunner:
     async def _shape_release(self, loop, secret, rows, name, namespace, revision):
         """shape_release on the worker thread. The thread stops itself at its time budget, and the
         jobs are bounded: a job that outlives its op (timeout) still counts until it ends."""
+        budget = self.redact_budget
+        return await self._run_job(
+            self.pool, '_jobs', MAX_RELEASE_JOBS,
+            lambda: shape_release(secret, rows, name, namespace, revision, budget=budget))
+
+    async def _light_job(self, fn, raw):
+        """Parse and shape pod or events JSON on the light worker thread, with the same kind of
+        deadline: nothing device-controlled is parsed on the event loop."""
+        deadline = time.monotonic() + LIGHT_BUDGET
+        return await self._run_job(self.light_pool, '_light_jobs', MAX_LIGHT_JOBS, lambda: fn(raw, deadline))
+
+    async def _run_job(self, pool, counter, limit, fn):
+        """Run `fn` on `pool` with an exact slot count in `self.<counter>`: the slot is taken before
+        the job is submitted and given back by a done-callback of the submitted future, which fires
+        exactly once when the job ends, raises, or is cancelled while still queued (a job that was
+        cancelled in the queue never runs, so only the future knows). A running job that outlives
+        its op (timeout) keeps its slot until it ends."""
         with self._jobs_lock:
-            if self._jobs >= MAX_RELEASE_JOBS:
-                raise Failure('busy', 'The inspect pod is still busy with other releases. Try again.',
+            if getattr(self, counter) >= limit:
+                raise Failure('busy', 'The inspect pod is still busy with other jobs. Try again.',
                               retry_after=5)
-            self._jobs += 1
+            setattr(self, counter, getattr(self, counter) + 1)
 
-        started = False
-
-        def job():
-            nonlocal started
-            started = True                   # from here on the job's own `finally` gives the slot back
-            try:
-                return shape_release(secret, rows, name, namespace, revision, budget=self.redact_budget)
-            finally:
-                with self._jobs_lock:
-                    self._jobs -= 1
+        def give_back(_future):
+            with self._jobs_lock:
+                setattr(self, counter, getattr(self, counter) - 1)
         try:
-            return await loop.run_in_executor(self.pool, job)
-        except RuntimeError:
-            if not started:                  # executor shut down: the job never ran
-                with self._jobs_lock:
-                    self._jobs -= 1
+            future = pool.submit(fn)
+        except BaseException:                    # executor shut down: nothing was queued
+            give_back(None)
             raise
+        future.add_done_callback(give_back)
+        return await asyncio.wrap_future(future)
 
     # -- housekeeping
 
@@ -1045,10 +1099,15 @@ class InspectRunner:
         self.states.clear()
         for st in states:
             await self._close_state(st)
-        self.pool.shutdown(wait=False)
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.light_pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _json(raw):
+def _json(raw, max_containers=None):
+    """json.loads of device output. `max_containers` bounds the objects plus arrays (counted on the
+    raw bytes, an upper bound) before anything is built."""
+    if max_containers is not None and raw.count(b'{') + raw.count(b'[') > max_containers:
+        raise Failure('too_large', 'The device answered with something too complex to read.')
     try:
         return json.loads(raw)
     except (RecursionError, MemoryError):

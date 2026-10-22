@@ -422,6 +422,58 @@ class TestShaping(unittest.TestCase):
         self.assertEqual(out['events'][-1]['reason'], 'r249')
         self.assertEqual(out['events'][0]['reason'], 'r50')
 
+    def test_events_streaming_matches_sorting_everything(self):
+        import random
+        rnd = random.Random(7)
+        for n in (0, 1, 199, 200, 201, 700):
+            items = [{'reason': 'r%d' % i, 'type': 'Normal',
+                      'lastTimestamp': '2026-10-22T10:%02d:00Z' % rnd.randrange(0, 4)} for i in range(n)]
+            items += [3, None, 'x']                       # not events: skipped, not counted
+            out = inspect_ops.shape_events({'items': items})
+            rows = [{'type': 'Normal', 'reason': e['reason'], 'message': None, 'count': None, 'first': None,
+                     'last': e['lastTimestamp'], 'source': None} for e in items if isinstance(e, dict)]
+            rows.sort(key=lambda r: str(r['last'] or ''))       # the old, stable, build-everything way
+            self.assertEqual(out['events'], rows[-200:], n)
+            self.assertEqual(out['truncated'], n > 200, n)
+
+    def test_events_rows_are_built_only_for_what_can_be_kept(self):
+        built = []
+
+        class Spy(dict):
+            def get(self, key, default=None):
+                if key == 'message':
+                    built.append(1)
+                return dict.get(self, key, default)
+        items = [Spy(reason='r%d' % i, lastTimestamp='2026-10-22T10:%02d:%02dZ' % (i // 60, i % 60))
+                 for i in range(2000)]
+        items.reverse()                                       # oldest last: nothing after the first 200 qualifies
+        inspect_ops.shape_events({'items': items})
+        self.assertEqual(len(built), 200)
+
+    def test_events_and_pod_shaping_stop_at_the_deadline(self):
+        past = time.monotonic() - 1
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops.shape_events({'items': [{'reason': 'x'}]}, deadline=past)
+        self.assertEqual(cm.exception.code, 'too_large')
+        for fn in (inspect_ops.shape_pod_json, inspect_ops.shape_events_json):
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                fn(b'{"items": []}', past)
+            self.assertEqual(cm.exception.code, 'too_large')
+
+    def test_json_container_bound_is_checked_before_parsing(self):
+        orig = inspect_ops.json.loads
+
+        def boom(*a, **k):
+            raise AssertionError('parsed')
+        inspect_ops.json.loads = boom
+        try:
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                inspect_ops._json(b'[' + b'{},' * 20 + b'{}]', 10)
+            self.assertEqual(cm.exception.code, 'too_large')
+        finally:
+            inspect_ops.json.loads = orig
+        self.assertEqual(inspect_ops._json(b'[{},{}]', 10), [{}, {}])
+
     def req_logs(self, **kw):
         return inspect_ops.parse_request(dict({'v': 1, 'op': 'logs', 'namespace': 'n', 'pod': 'p'}, **kw))
 
@@ -467,8 +519,10 @@ class TestRelease(unittest.TestCase):
         self.assertIn('# <hidden: document could not be parsed>', text)
         self.assertIn('# keep this comment', text)               # untouched documents keep their text
         self.assertIn('LOG_LEVEL: info', text)
-        self.assertIn('visible', text)                           # ConfigMap item inside a SecretList stays
-        self.assertEqual(text.count('<hidden>'), 5)              # 2 data + 1 stringData + annotation + list item
+        self.assertNotIn('visible', text)                        # a document with top-level items is hidden whole
+        self.assertIn('# Source: nvr/templates/list.yaml', text)
+        self.assertIn('# <hidden: document has a top-level items key>', text)
+        self.assertEqual(text.count('<hidden>'), 4)              # 2 data + 1 stringData + annotation
         import yaml
         docs = [d for d in yaml.safe_load_all(text) if d]
         secret = docs[0]
@@ -476,7 +530,6 @@ class TestRelease(unittest.TestCase):
         self.assertEqual(secret['stringData'], {'token': '<hidden>'})
         self.assertEqual(secret['metadata']['name'], 'nvr-db')
         self.assertEqual(list(secret)[:3], ['apiVersion', 'kind', 'metadata'])   # order kept
-        self.assertEqual(docs[-1]['items'][0]['data'], {'k': '<hidden>'})
 
     def test_secret_with_odd_shapes(self):
         text = inspect_ops.redact_manifest('---\nkind: Secret\ndata: not-a-map\nbinaryData:\n  a: AAAA\n')
@@ -582,27 +635,32 @@ class TestRelease(unittest.TestCase):
             for name, doc in (
                     ('secret', 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '[' * depth + ']' * depth + '\n'),
                     ('list', 'kind: SecretList\nitems: ' + '[' * depth + ']' * depth + '\n'),
-                    ('kind last', 'x: ' + '[' * depth + ']' * depth + '\nkind: Secret\n'),
-                    ('maps', 'kind: Secret\nx: ' + '{a: ' * (depth // 5) + '1' + '}' * (depth // 5) + '\n')):
+                    ('kind last', 'x: ' + '[' * depth + ']' * depth + '\nkind: Secret\n')):
                 text = self.on_small_stack(inspect_ops.redact_manifest, '---\n# Source: x\n' + doc)
-                self.assertIn('# <hidden: document too deep to redact>', text, (name, depth))
+                self.assertIn('<hidden: ', text, (name, depth))      # nested lists and items: hidden whole
                 self.assertIn('# Source: x', text)
                 self.assertNotIn('LEAK1', text)
+            doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * (depth // 5) + '1' + '}' * (depth // 5) + '\n'
+            text = self.on_small_stack(inspect_ops.redact_manifest, '---\n# Source: x\n' + doc)
+            self.assertIn('# <hidden: document too deep to redact>', text, depth)
+            self.assertIn('# Source: x', text)
+            self.assertNotIn('LEAK1', text)
 
     def test_deep_documents_that_are_not_sensitive_pass_as_text(self):
-        doc = 'kind: ConfigMap\nx: ' + '[' * 20000 + ']' * 20000 + '\n'
+        doc = 'kind: ConfigMap\nx: ' + '{a: ' * 4000 + '1' + '}' * 4000 + '\n'
         text = self.on_small_stack(inspect_ops.redact_manifest, '---\n' + doc)
         self.assertIn('kind: ConfigMap', text)
-        self.assertNotIn('too deep', text)
+        self.assertNotIn('<hidden', text)
 
     def test_moderate_nesting_is_still_redacted(self):
-        nested = 'x: ' + '[' * 30 + ']' * 30 + '\n'
+        nested = 'x: ' + '{a: ' * 30 + '1' + '}' * 30 + '\n'
         text = self.on_small_stack(inspect_ops.redact_manifest, '---\nkind: Secret\ndata: {a: LEAK1}\n' + nested)
         self.assertNotIn('LEAK1', text)
         self.assertNotIn('too deep', text)
+        self.assertIn('a: <hidden>', text)
 
     def test_deep_secret_in_a_release_is_survived(self):
-        doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '[' * 5000 + ']' * 5000 + '\n'
+        doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * 1000 + '1' + '}' * 1000 + '\n'
         out = self.on_small_stack(
             inspect_ops.shape_release, helm_release('---\n' + doc), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3)
         self.assertNotIn('LEAK1', out['manifest'])
@@ -627,12 +685,11 @@ class TestRelease(unittest.TestCase):
             self.assertNotIn('LEAK2', text, name)
             self.assertIn('# Source: x', text, name)
 
-    def test_loaded_document_with_a_non_string_kind_is_hidden(self):
-        # even when the classifier let it through, a non-string kind or key fails closed
-        for obj in ({b'kind': 'Secret'}, {'kind': b'Secret'}, {'kind': 'List', 'items': [{'kind': b'Secret'}]},
-                    {'kind': 'List', 'items': [{b'kind': 'Secret'}]}):
+    def test_loaded_document_that_is_not_a_plain_mapping_is_hidden(self):
+        # even when the scan let it through, the second check on the built object fails closed
+        for obj in ({b'kind': 'Secret'}, {'kind': b'Secret'}, {'kind': 3}, {}, [b'x'], 'x', None):
             self.assertTrue(inspect_ops._fail_closed(obj), obj)
-        for obj in ({'kind': 'Secret'}, {'kind': 'List', 'items': [{'kind': 'Secret'}, 3]}, [b'x'], {}):
+        for obj in ({'kind': 'Secret'}, {'kind': 'ConfigMap', 'data': {1: 2}}):
             self.assertFalse(inspect_ops._fail_closed(obj), obj)
 
     def test_release_json_nested_too_deep_is_a_contract_error(self):
@@ -648,11 +705,64 @@ class TestRelease(unittest.TestCase):
             inspect_ops._json('[' * 300000 + ']' * 300000)
         self.assertIn(cm.exception.code, ('too_large', 'device_error'))
 
+    def test_secret_values_never_come_back_through_an_alias(self):
+        # yaml.load resolves the alias, the redaction hides `data`, but safe_dump used to write the
+        # aliased copy in plain text. Any anchor, alias, merge key or tag hides the whole document.
+        cases = {
+            'alias in a Secret': 'kind: Secret\ndata: &d {password: LEAK1}\nbackup: *d\n',
+            'alias in annotations': 'kind: Secret\nmetadata:\n  annotations: &a {x: LEAK1}\n  labels: *a\n'
+                                    'stringData: {token: LEAK2}\n',
+            'anchor only': 'kind: Secret\ndata: &d {password: LEAK1}\n',
+            'anchor on a scalar': 'kind: Secret\ndata: {password: &p LEAK1}\nstringData: {x: *p}\n',
+            'merge key': 'kind: Secret\nbase: &b {k: LEAK1}\ndata:\n  <<: *b\n',
+            'merge key only': 'kind: Secret\ndata:\n  <<: {k: LEAK1}\n',
+            'alias in a ConfigMap': 'kind: ConfigMap\ndata: &d {password: LEAK1}\ncopy: *d\n',
+            'anchored kind': 'kind: &k Secret\ndata: {password: LEAK1}\n',
+        }
+        for name, body in cases.items():
+            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
+            self.assertNotIn('LEAK1', text, name)
+            self.assertNotIn('LEAK2', text, name)
+            self.assertIn('# Source: x', text, name)
+            self.assertIn('# <hidden: document uses a YAML', text, name)
+
+    def test_documents_with_items_or_list_kinds_or_nested_lists_are_hidden_whole(self):
+        secret = '{kind: Secret, data: {password: LEAK1}, stringData: {token: LEAK2}}'
+        cases = {
+            'items of lists': 'kind: List\nitems:\n- - %s\n' % secret,
+            'items of lists, flow': 'kind: List\nitems: [[%s]]\n' % secret,
+            'items of lists in lists': 'kind: SecretList\nitems: [[[%s]]]\n' % secret,
+            'Secret list': 'kind: SecretList\nitems: [%s]\n' % secret,
+            'List of one': 'kind: List\nitems:\n- %s\n' % secret,
+            'unknown kind with items': 'kind: Whatever\nitems: [%s]\n' % secret,
+            'ConfigMap with items': 'kind: ConfigMap\nitems: [%s]\n' % secret,
+            'Secret with items': 'kind: Secret\ndata: {password: LEAK1}\nitems: [x]\n',
+            'items without kind': 'items: [%s]\n' % secret,
+            'items in other case': 'kind: ConfigMap\nITEMS: [%s]\n' % secret,
+            'List kind, other case': 'kind: secretlist\nlist: [%s]\n' % secret,
+            'List kind without items': 'kind: SecretList\ndata: {password: LEAK1}\n',
+            'nested lists': 'kind: ConfigMap\ndata: [[%s]]\n' % secret,
+            'nested lists, block': 'kind: Deployment\nspec:\n  x:\n  - - %s\n' % secret,
+        }
+        for name, body in cases.items():
+            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
+            self.assertNotIn('LEAK1', text, name)
+            self.assertNotIn('LEAK2', text, name)
+            self.assertIn('# Source: x', text, name)
+            self.assertIn('# <hidden: ', text, name)
+            self.assertNotIn('kind:', text, name)
+
+    def test_the_manifest_after_a_hidden_document_is_still_shown(self):
+        text = inspect_ops.redact_manifest(
+            '---\nkind: List\nitems: [[LEAK1]]\n---\nkind: ConfigMap\ndata: {a: shown}\n'
+            '---\nkind: Secret\ndata: {a: LEAK2}\n')
+        self.assertNotIn('LEAK', text)
+        self.assertIn('a: shown', text)
+        self.assertIn('a: <hidden>', text)
+
     def test_plain_documents_pass_as_text_without_being_loaded(self):
         docs = ['kind: ConfigMap\ndata: {kind: Secret}\n',                  # nested kind is not the kind
-                'kind: Deployment\nspec:\n  kind: Secret\n',
-                '- kind: Secret\n  data: {a: visible}\n',                   # a sequence document
-                'just a scalar\n']
+                'kind: Deployment\nspec:\n  kind: Secret\n  containers:\n  - name: a\n    args: [x, y]\n']
         orig = inspect_ops.yaml.load
 
         def boom(*a, **k):
@@ -664,6 +774,19 @@ class TestRelease(unittest.TestCase):
                 self.assertEqual(text, '---\n' + body.strip('\n') + '\n')
         finally:
             inspect_ops.yaml.load = orig
+
+    def test_documents_that_are_not_plain_mappings_are_hidden(self):
+        # fail closed: only a plain mapping with a string kind is ever shown
+        for body in ('- kind: Secret\n  data: {a: LEAK1}\n', 'LEAK1 as a scalar\n', 'apiVersion: v1\ndata: {a: LEAK1}\n',
+                     'kind: 7\ndata: {a: LEAK1}\n', 'kind: null\ndata: {a: LEAK1}\n', 'kind:\ndata: {a: LEAK1}\n',
+                     'kind: [Secret]\ndata: {a: LEAK1}\n', '1: x\nkind: ConfigMap\ndata: {a: LEAK1}\n',
+                     'kind: ConfigMap\nkind: Secret\ndata: {a: LEAK1}\n',
+                     'Kind: Secret\ndata: {a: LEAK1}\n', 'KIND: Secret\ndata: {a: LEAK1}\n',
+                     '? [a]\n: b\nkind: ConfigMap\ndata: {a: LEAK1}\n'):
+            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
+            self.assertNotIn('LEAK1', text, body)
+            self.assertIn('# Source: x', text, body)
+            self.assertIn('# <hidden: ', text, body)
 
     def test_secret_document_over_the_load_cap_is_hidden(self):
         body = 'kind: Secret\ndata:\n  a: LEAK1\n  pad: "%s"\n' % ('x' * inspect_ops.SECRET_DOC_CAP)
@@ -693,13 +816,20 @@ class TestRelease(unittest.TestCase):
             import inspect_ops, yaml
             variant = sys.argv[2]
             if variant == 'flow':
-                body = 'kind: ConfigMap\\nx: [' + ','.join(['1'] * 1900000) + ']\\n'
+                body = 'kind: ConfigMap\\nx: [' + ','.join(['1'] * 900000) + ']\\n'
             elif variant == 'block':
-                body = 'kind: ConfigMap\\nx:\\n' + '- a\\n' * 1000000
+                body = 'kind: ConfigMap\\nx:\\n' + '- a\\n' * 500000
             else:    # many tiny documents
-                body = '---\\n'.join('a: 1\\n' for _ in range(400000))
+                body = '---\\n'.join('kind: ConfigMap\\n' for _ in range(100000))
             manifest = '---\\n' + body
             assert len(manifest) <= inspect_ops.MANIFEST_CAP, len(manifest)
+            # the cost of just streaming the events: the time bound is relative to it, so a slow
+            # libyaml or a slow machine does not fail the test (the image runs PyYAML 6.0.2 on musl)
+            started = time.monotonic()
+            for chunk in (manifest.split('---\\n') if variant == 'tiny' else [manifest]):
+                for _ in yaml.parse(chunk, Loader=inspect_ops._YAML_LOADER):
+                    pass
+            baseline = time.monotonic() - started
             before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             started = time.monotonic()
             try:
@@ -708,7 +838,7 @@ class TestRelease(unittest.TestCase):
             except inspect_ops.Failure as f:
                 ok = f.code == 'too_large'
             after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            print(ok, (after - before) // 1024, round(time.monotonic() - started, 2))
+            print(ok, (after - before) // 1024, round(time.monotonic() - started, 2), round(baseline, 2))
         ''')
         app_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app')
         for variant in ('flow', 'block', 'tiny'):
@@ -716,7 +846,9 @@ class TestRelease(unittest.TestCase):
                                  text=True, timeout=60, check=True).stdout.split()
             self.assertEqual(out[0], 'True', variant)
             self.assertLess(int(out[1]), 64, '%s grew by %s MiB' % (variant, out[1]))
-            self.assertLess(float(out[2]), 5.0, '%s took %s s' % (variant, out[2]))
+            # relative to streaming the same events once: still catches composing the document
+            self.assertLess(float(out[2]), 8 * float(out[3]) + 1.0,
+                            '%s took %s s, streaming alone %s s' % (variant, out[2], out[3]))
 
     def test_release_must_match_the_request(self):
         rows = [(3, 'deployed')]
@@ -742,6 +874,9 @@ class TestRelease(unittest.TestCase):
         with self.assertRaises(inspect_ops.Failure) as cm:
             inspect_ops.decode_release(data)
         self.assertEqual(cm.exception.code, 'too_large')
+
+    def test_manifest_cap_matches_the_backend(self):
+        self.assertEqual(inspect_ops.MANIFEST_CAP, 2 * 1024 * 1024)     # RELEASE_MAX_MANIFEST_BYTES
 
     def test_release_json_cap_is_8_mib(self):
         self.assertEqual(inspect_ops.RELEASE_JSON_CAP, 8 * 1024 * 1024)
@@ -906,6 +1041,113 @@ class TestEndpoint(InspectHTTPBase):
         self.assertIsInstance(data['ms'], int)
         self.assertEqual(data['result']['pod']['metadata'], {'name': 'nvr-1'})
         self.assertEqual(data['result']['pod']['spec']['containers'][0]['env'][0]['value'], '<hidden>')
+
+    def test_pod_and_events_are_parsed_off_the_event_loop(self):
+        threads = []
+        orig_pod, orig_events = inspect_ops.prune_pod, inspect_ops.shape_events
+
+        def pod(doc):
+            threads.append(threading.current_thread())
+            return orig_pod(doc)
+
+        def events(doc, *a, **k):
+            threads.append(threading.current_thread())
+            return orig_events(doc, *a, **k)
+        self.scenario({'ops': [{'match': 'get pod', 'stdout': '{"metadata":{"name":"nvr-1"}}'},
+                               {'match': 'get events', 'stdout': '{"items":[]}'}]})
+        inspect_ops.prune_pod, inspect_ops.shape_events = pod, events
+        try:
+            self.assertEqual(self.post(self.POD).code, 200)
+            self.assertEqual(self.post(dict(self.POD, op='events')).code, 200)
+        finally:
+            inspect_ops.prune_pod, inspect_ops.shape_events = orig_pod, orig_events
+        self.assertEqual(len(threads), 2)
+        for t in threads:
+            self.assertIsNot(t, threading.main_thread())
+            self.assertTrue(t.name.startswith('inspect'), t.name)
+
+    def test_pod_and_events_json_with_too_many_objects_is_too_large(self):
+        # under the byte caps, but ~100 MiB once json.loads has built it: refused before parsing
+        pod = '[' + ','.join(['{}'] * (inspect_ops.POD_JSON_CONTAINERS + 10)) + ']'
+        events = '[' + ','.join(['{}'] * (inspect_ops.EVENTS_JSON_CONTAINERS + 10)) + ']'
+        self.assertLess(len(pod), inspect_ops.POD_CAP)
+        self.assertLess(len(events), inspect_ops.EVENTS_CAP)
+        self.scenario({'ops': [{'match': 'get pod', 'stdout': pod}, {'match': 'get events', 'stdout': events}]})
+        self.err(self.post(self.POD), 413, 'too_large')
+        self.err(self.post(dict(self.POD, op='events')), 413, 'too_large')
+        runner = self.app.settings['inspect_runner']
+        self.assertEqual(runner._light_jobs, 0)
+
+    def test_pod_and_events_jobs_are_bounded_and_counted(self):
+        self.scenario({'ops': [{'match': 'get pod', 'stdout': '{"metadata":{"name":"nvr-1"}}'}]})
+        runner = self.app.settings['inspect_runner']
+        runner._light_jobs = inspect_ops.MAX_LIGHT_JOBS
+        self.assertEqual(self.err(self.post(self.POD), 429, 'busy')['retryAfter'], 5)
+        runner._light_jobs = 0
+        self.assertEqual(self.post(self.POD).code, 200)
+        self.assertEqual(runner._light_jobs, 0)
+
+    def _blocked_pool(self, runner):
+        release, started = threading.Event(), threading.Event()
+
+        def block():
+            started.set()
+            release.wait(20)
+        runner.pool.submit(block)
+        self.assertTrue(started.wait(5))
+        self.addCleanup(release.set)
+        return release
+
+    def test_job_slots_of_cancelled_queued_jobs_are_given_back(self):
+        # The op's 20 s wait_for cancels a job that is still queued behind a running one. Such a job
+        # never runs, so only the submitted future can give its slot back.
+        runner = self.app.settings['inspect_runner']
+        self._blocked_pool(runner)
+
+        async def go():
+            seen = []
+            for _ in range(inspect_ops.MAX_RELEASE_JOBS + 3):
+                with self.assertRaises(asyncio.TimeoutError):     # busy would be a Failure instead
+                    await asyncio.wait_for(runner._shape_release(asyncio.get_running_loop(), 'x', [], 'nvr',
+                                                                 'teknoir-demo', 3), 0.05)
+                seen.append(runner._jobs)
+            return seen
+        self.assertEqual(self.io_loop.run_sync(go), [0] * (inspect_ops.MAX_RELEASE_JOBS + 3))
+
+    def test_job_slot_of_a_running_job_is_held_until_it_ends(self):
+        runner = self.app.settings['inspect_runner']
+        release, started = threading.Event(), threading.Event()
+        orig = inspect_ops.shape_release
+
+        def slow(*a, **k):
+            started.set()
+            release.wait(20)
+            return {'ok': True}
+        inspect_ops.shape_release = slow
+        self.addCleanup(setattr, inspect_ops, 'shape_release', orig)
+        self.addCleanup(release.set)
+
+        async def go():
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(runner._shape_release(asyncio.get_running_loop(), 'x', [], 'nvr',
+                                                             'teknoir-demo', 3), 0.3)
+            return started.is_set(), runner._jobs
+        self.assertEqual(self.io_loop.run_sync(go), (True, 1))     # cancelled but still running
+        release.set()
+        for _ in range(100):
+            if runner._jobs == 0:
+                break
+            time.sleep(0.05)
+        self.assertEqual(runner._jobs, 0)
+
+    def test_events_end_to_end_keeps_the_newest_200(self):
+        items = [{'reason': 'r%d' % i, 'lastTimestamp': '2026-10-22T%02d:%02d:00Z' % (i // 60, i % 60)}
+                 for i in range(500)]
+        self.scenario({'ops': [{'match': 'get events', 'stdout': json.dumps({'items': items})}]})
+        result = self.body_of(self.post(dict(self.POD, op='events')))['result']
+        self.assertTrue(result['truncated'])
+        self.assertEqual([e['reason'] for e in result['events']][:2], ['r300', 'r301'])
+        self.assertEqual(len(result['events']), 200)
 
     def test_log_line_has_no_content(self):
         self.scenario({'ops': [{'match': 'logs', 'stdout': 'SUPERSECRETLINE\n'}]})
