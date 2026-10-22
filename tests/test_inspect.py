@@ -37,6 +37,9 @@ FAKE_SSH = textwrap.dedent('''\
     sc = json.load(open(os.path.join(d, 'scenario.json')))
     cp = argv[argv.index('-S') + 1] if '-S' in argv else None
     entry = {'argv': argv, 'pid': os.getpid(), 'cp_existed': bool(cp and os.path.exists(cp))}
+    if argv and ' -f -' in argv[-1] and '-O' not in argv and 'ControlMaster=yes' not in argv:
+        import base64
+        entry['stdin_b64'] = base64.b64encode(sys.stdin.buffer.read()).decode()
     with open(os.path.join(d, 'calls.jsonl'), 'a') as fh:
         fh.write(json.dumps(entry) + '\\n')
     def finish(rc, out=b'', err=''):
@@ -169,6 +172,25 @@ items:
     metadata: {name: b}
     data: {k: visible}
 '''
+
+
+def kubectl_out(*objects):
+    """What `kubectl create --dry-run=client -o json -f -` prints for several documents: the
+    objects one after the other, pretty printed (verified against kubectl 1.35)."""
+    return ''.join(json.dumps(o, indent=4) + '\n' for o in objects)
+
+
+SECRET_OBJ = {'apiVersion': 'v1', 'kind': 'Secret',
+              'metadata': {'name': 'nvr-db', 'namespace': 'teknoir-demo', 'annotations': {
+                  'kubectl.kubernetes.io/last-applied-configuration': '{"data":{"pw":"c3VwZXI="}}'}},
+              'type': 'Opaque', 'data': {'password': 'aHVudGVyMg==', 'user': 'YWRtaW4='},
+              'stringData': {'token': 'plain-text-token'}}
+CONFIGMAP_OBJ = {'apiVersion': 'v1', 'kind': 'ConfigMap',
+                 'metadata': {'name': 'nvr-config', 'namespace': 'teknoir-demo'}, 'data': {'LOG_LEVEL': 'info'}}
+KUBECTL_OK = kubectl_out(SECRET_OBJ, CONFIGMAP_OBJ)
+CREATE = 'create --dry-run=client'      # matches the manifest decode command in the fake ssh scenarios
+
+
 
 
 class TestValidation(unittest.TestCase):
@@ -510,525 +532,279 @@ class TestShaping(unittest.TestCase):
 
 
 class TestRelease(unittest.TestCase):
-    # --- manifest redaction: strict parse, re-serialization (plans/nextgen/inspect.md 3.4) ---
+    # --- kubectl's JSON -> objects: Secret redaction on JSON, never on YAML (plans/nextgen/inspect.md 3.4) ---
 
-    @staticmethod
-    def show(body):
-        return inspect_ops.redact_manifest('---\n' + body)
+    KEPT = {'status': 'deployed', 'chart': 'nvr', 'chartVersion': '0.4.2', 'appVersion': '1.2.0',
+            'last_deployed': '2026-10-02T10:00:00Z'}
+    ROWS = [(3, 'deployed'), (2, 'superseded')]
 
-    @staticmethod
-    def hidden_reason(text):
-        return [line for line in text.splitlines() if line.startswith('# <hidden: ')]
+    def shape(self, out, rc=0, err=b'', **kw):
+        if isinstance(out, str):
+            out = out.encode()
+        if isinstance(err, str):
+            err = err.encode()
+        return inspect_ops.shape_release_objects(self.KEPT, self.ROWS, 'nvr', 'teknoir-demo', 3, rc, out, err, **kw)
 
-    def test_redaction(self):
-        text = inspect_ops.redact_manifest(MANIFEST)
-        for leaked in ('aHVudGVyMg', 'YWRtaW4', 'plain-text-token', 'leaked-in-broken-doc', 'dmFsdWU', 'c3VwZXI',
-                       'visible', 'keep this comment', '# Source'):
-            self.assertNotIn(leaked, text)
-        self.assertEqual(text.splitlines()[0], '# comments are not shown')
-        self.assertEqual(text.count('# comments are not shown'), 1)
-        self.assertIn('LOG_LEVEL: info', text)
-        self.assertEqual(self.hidden_reason(text), ['# <hidden: document could not be parsed>',
-                                                    '# <hidden: document is a list>'])
-        import yaml
-        docs = [d for d in yaml.safe_load_all(text) if d]
-        self.assertEqual(docs[0], {
-            'apiVersion': 'v1', 'kind': 'Secret', 'metadata': {'name': 'nvr-db'}, 'type': 'Opaque',
-            'data': {'password': '<hidden>', 'user': '<hidden>'}, 'stringData': {'token': '<hidden>'}})
-        self.assertEqual(list(docs[0]), ['apiVersion', 'kind', 'metadata', 'type', 'data', 'stringData'])
-        self.assertEqual(docs[1]['data'], {'LOG_LEVEL': 'info'})
+    def objects(self, *objs):
+        return self.shape(kubectl_out(*objs))['objects']
 
-    def test_helm_like_manifest_still_renders(self):
-        import yaml
-        manifest = textwrap.dedent('''\
-            ---
-            # Source: web/templates/deployment.yaml
-            apiVersion: apps/v1
-            kind: Deployment
-            metadata:
-              name: web
-              labels: {app: web}
-            spec:
-              replicas: 2
-              selector:
-                matchLabels: {app: web}
-              template:
-                metadata:
-                  labels: {app: web}
-                spec:
-                  containers:
-                  - name: web
-                    image: "ghcr.io/teknoir/web:1.2.0"
-                    args: ["--port", "8080"]
-                    env:
-                    - {name: LOG_LEVEL, value: "info"}
-                    ports:
-                    - containerPort: 8080
-            ---
-            # Source: web/templates/service.yaml
-            apiVersion: v1
-            kind: Service
-            metadata:
-              name: web
-            spec:
-              ports:
-              - port: 80
-                targetPort: 8080
-              selector: {app: web}
-            ---
-            # Source: web/templates/configmap.yaml
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: web
-            data:
-              config.json: |
-                {"a": 1,
-                 "b": [1, 2]}
-              note: "plain # not a comment"
-            ---
-            # Source: web/templates/secret.yaml
-            apiVersion: v1
-            kind: Secret
-            metadata:
-              name: web
-              labels: {app: web}
-            type: Opaque
-            data:
-              password: aHVudGVyMg==
-        ''')
-        text = inspect_ops.redact_manifest(manifest)
-        self.assertNotIn('aHVudGVyMg', text)
-        shown = [d for d in yaml.safe_load_all(text) if d]
-        expected = [d for d in yaml.safe_load_all(manifest) if d]
-        expected[3]['data'] = {'password': '<hidden>'}
-        self.assertEqual(shown, expected)
-        self.assertEqual([d['kind'] for d in shown], ['Deployment', 'Service', 'ConfigMap', 'Secret'])
-        self.assertEqual(self.hidden_reason(text), [])
-        self.assertEqual(shown[2]['data']['config.json'], '{"a": 1,\n "b": [1, 2]}\n')
-
-    # --- document splitting like Kubernetes' YAMLReader (plans/nextgen/inspect.md 3.4) ---
-
-    SECRET_IN_KEY = 'kind: ConfigMap\nmetadata: {name: x}\n%s\nkind: Secret\ndata: {a: LEAK1}\n'
-
-    def test_separator_with_a_glued_comment_splits_like_kubernetes(self):
-        # `---#x: |` ends the ConfigMap for Kubernetes, which then reads a Secret out of the rest;
-        # here the rest is its own document and shown as a Secret (keys only), never as text
-        import yaml
-        for sep in ('---#x: |', '---\u00a0#x: |', '---\t#x: |', '---\u0085#x: |', '---\u3000#x: |', '--- #x: |'):
-            text = inspect_ops.redact_manifest('---\n' + self.SECRET_IN_KEY % sep)
-            self.assertNotIn('LEAK1', text, sep)
-            self.assertNotIn('# <hidden', text, sep)
-            self.assertEqual([d['kind'] for d in yaml.safe_load_all(text) if d], ['ConfigMap', 'Secret'], sep)
-
-    def test_the_reviewers_repro_hides_the_nested_secret(self):
-        manifest = ('---\nkind: ConfigMap\nmetadata: {name: x}\n---#x: |\n'
-                    '  apiVersion: v1\n  kind: Secret\n  data: {password: LEAK1}\n')
-        text = inspect_ops.redact_manifest(manifest)
-        self.assertNotIn('LEAK1', text)
-        self.assertIn('password: <hidden>', text)       # the Secret half is read as a Secret
-        self.assertEqual(self.hidden_reason(text), [])
-
-    def test_separator_line_with_a_comment_still_separates(self):
-        import yaml
-        for sep in ('--- # comment', '---# comment', '---\t# c', '---   ', '---\u00a0# c', '---\u2003', '---\r'):
-            manifest = '---\nkind: ConfigMap\ndata: {a: one}\n%s\nkind: ConfigMap\ndata: {b: two}\n' % sep
-            text = inspect_ops.redact_manifest(manifest)
-            if '\r' in sep:       # the CR of the separator is dropped with it; no other line has one
-                manifest = manifest.replace('\r', '')
-            shown = [d for d in yaml.safe_load_all(inspect_ops.redact_manifest(manifest)) if d]
-            self.assertEqual([d['data'] for d in shown], [{'a': 'one'}, {'b': 'two'}], sep)
-            self.assertEqual(self.hidden_reason(text), [], sep)
-
-    def test_a_dash_line_that_is_no_separator_hides_the_document(self):
-        for line in ('---x', '--- x', '---{a: b}', '---|', '--- !!map', '...', '... x', '...#c'):
-            text = inspect_ops.redact_manifest(
-                '---\nkind: ConfigMap\ndata: {before: shown}\n---\nkind: ConfigMap\n%s\ndata: {a: LEAK1}\n'
-                '---\nkind: ConfigMap\ndata: {after: shown}\n' % line)
-            self.assertNotIn('LEAK1', text, line)
-            self.assertEqual(len(self.hidden_reason(text)), 1, line)
-            self.assertIn('before: shown', text, line)
-            self.assertIn('after: shown', text, line)
-
-    def test_a_key_that_looks_like_a_document_marker_hides_the_document(self):
-        for key in ('---#x', '---', '----', '--- x', '...', '...x', '"---#x"', "'...'"):
-            for body in ('kind: ConfigMap\nm:\n  %s: |\n    kind: Secret\n    data: {a: LEAK1}\n' % key,
-                         'kind: ConfigMap\ndata:\n  %s: LEAK1\n' % key,
-                         'kind: ConfigMap\nl:\n- %s: LEAK1\n' % key):
-                text = self.show(body)
-                self.assertNotIn('LEAK1', text, key)
-                self.assertEqual(len(self.hidden_reason(text)), 1, (key, body))
-
-    def test_other_keys_with_dashes_are_still_shown(self):
-        text = self.show('kind: ConfigMap\ndata:\n  "--flag": a\n  "-x": b\n  "..": c\n  a---b: d\n')
-        self.assertEqual(self.hidden_reason(text), [])
-        self.assertIn('--flag: a', text)
-
-    def test_output_is_a_reserialization_not_the_original_text(self):
-        text = self.show('# lead\nkind: ConfigMap  # trailing\ndata: {a: 1, b: "x"}   # more\n')
-        self.assertEqual(text, '# comments are not shown\n---\nkind: ConfigMap\ndata:\n  a: 1\n  b: x\n')
-        self.assertEqual(inspect_ops.redact_manifest(''), '')
-        self.assertEqual(inspect_ops.redact_manifest('---\n# only a comment\n---\n\n'), '')
-
-    def test_comment_lines_carrying_a_key_block_are_dropped(self):
-        body = ('kind: ConfigMap\n# -----BEGIN RSA PRIVATE KEY-----\n# MIIEowIBAAKCAQEAKEYBODY\n'
-                '# -----END RSA PRIVATE KEY-----\ndata: {a: b}\n')
-        text = self.show('# -----BEGIN PRIVATE KEY-----\n' + body)
-        self.assertNotIn('KEYBODY', text)
-        self.assertNotIn('PRIVATE KEY', text)
-        self.assertIn('a: b', text)
-
-    # The parsers Kubernetes uses treat \r, U+0085, U+2028 and U+2029 as line breaks and skip a BOM at
-    # any line start; a redactor that does not hid a Secret in a 'comment' or a plain scalar.
-    UNUSUAL = {
-        'cr': '\r', 'nel': '\x85', 'line separator': '\u2028', 'paragraph separator': '\u2029',
-        'bom': '\ufeff', 'bell': '\x07', 'nul': '\x00', 'escape': '\x1b', 'vertical tab': '\x0b',
-        'form feed': '\x0c', 'del': '\x7f', 'c1 control': '\x9b', 'noncharacter': '\uffff',
-        'lone surrogate': '\ud800',
-    }
-
-    def test_unusual_characters_hide_the_document_whole(self):
-        for name, ch in self.UNUSUAL.items():
-            bodies = {
-                'comment': 'kind: ConfigMap\n#%s\nkind: Secret\ndata: {a: LEAK1}\n' % ch,
-                'plain scalar': 'kind: ConfigMap\ndata: x%s\nkind: Secret\nstringData: {a: LEAK1}\n' % ch,
-                'bom first': ch + 'kind: Secret\ndata: {a: LEAK1}\n',
-                'bom at a line start': 'kind: ConfigMap\n' + ch + 'kind: Secret\ndata: {a: LEAK1}\n',
-                'in a key': 'kind: Secret\ndata: {a: LEAK1}\nx%s: 1\n' % ch,
-            }
-            for where, body in bodies.items():
-                text = inspect_ops.redact_manifest(
-                    '---\nkind: ConfigMap\ndata: {before: shown}\n---\n' + body + '---\nkind: ConfigMap\ndata: {after: shown}\n')
-                case = (name, where)
-                self.assertNotIn('LEAK1', text, case)
-                self.assertEqual(self.hidden_reason(text), ['# <hidden: unusual characters>'], case)
-                self.assertIn('before: shown', text, case)       # the other documents are still shown
-                self.assertIn('after: shown', text, case)
-
-    def test_unusual_characters_cannot_hide_behind_a_separator(self):
-        # a line that is `---` plus a CR is not a separator for this splitter: the whole chunk is hidden
-        text = inspect_ops.redact_manifest('---\r\nkind: Secret\r\ndata: {a: LEAK1}\r\n---\r\nkind: Secret\ndata: {a: LEAK2}\n')
-        self.assertNotIn('LEAK', text)
-        self.assertEqual(self.hidden_reason(text), ['# <hidden: unusual characters>'])
-
-    def test_what_comes_in_through_an_escape_goes_out_as_an_escape(self):
-        text = self.show('kind: ConfigMap\ndata:\n  a: "x\\u2028y\\u0085z\\rq\\ufeff"\n')
-        self.assertEqual(self.hidden_reason(text), [])
-        self.assertIsNone(inspect_ops._UNUSUAL.search(text))
-        import yaml
-        self.assertEqual(list(yaml.safe_load_all(text))[0]['data']['a'], 'x\u2028y\x85z\rq\ufeff')
-
-    def test_anchors_aliases_and_tags_hide_the_document_on_every_node_type(self):
-        s = 'kind: Secret\ndata: {a: LEAK1}\n'
-        cases = {
-            'anchor on the root': '&r\n' + s,
-            'tag on the root': '!!map\n' + s,
-            'custom tag on the root': '!custom\n' + s,
-            'anchor on a map': s + 'm: &m {k: v}\n',
-            'anchor on a map, block': s + 'm: &m\n  k: v\n',
-            'tag on a map': s + 'm: !!map {k: v}\n',
-            'custom tag on a map': s + 'm: !foo {k: v}\n',
-            'anchor on a sequence': s + 'l: &l [a, b]\n',
-            'tag on a sequence': s + 'l: !!seq [a, b]\n',
-            'custom tag on a sequence': s + 'l: !foo [a]\n',
-            'anchor on a scalar': s + 'x: &x v\n',
-            'tag on a scalar': s + 'x: !!str v\n',
-            'tag on the kind': 'kind: !!str Secret\ndata: {a: LEAK1}\n',
-            'tag on a key': '!!str kind: Secret\ndata: {a: LEAK1}\n',
-            'binary kind': 'kind: !!binary U2VjcmV0\ndata: {a: LEAK1}\n',
-            'alias': 'a: &a v\n' + s + 'b: *a\n',
-            'alias of the data': 'kind: Secret\ndata: &d {a: LEAK1}\nbackup: *d\n',
-            'anchor on a Secret list item': 'kind: ConfigMap\nl:\n- &i {a: LEAK1}\n',
-            'anchor in a sequence item': 'kind: ConfigMap\nl:\n- &i x\n- *i\n',
-            'non-specific tag': 'kind: ConfigMap\nx: ! LEAK1\n',
-        }
-        for name, body in cases.items():
-            text = self.show(body)
-            self.assertNotIn('LEAK1', text, name)
-            self.assertEqual(self.hidden_reason(text),
-                             ['# <hidden: document uses YAML aliases, anchors, merge keys or tags>'], name)
-
-    def test_yaml_directives_hide_the_document(self):
-        for name, manifest in {
-            'inside a chunk': '---\nkind: ConfigMap\n...\n%YAML 1.1\n--- {kind: Secret, data: {a: LEAK1}}\n',
-            'explicit start with content': '--- {kind: Secret, data: {a: LEAK1}}\n',
-            'explicit start with a tag': '--- !!map\nkind: Secret\ndata: {a: LEAK1}\n',
-            'YAML directive': '%YAML 1.1\n--- {kind: Secret, data: {a: LEAK1}}\n',
-            'TAG directive': '%TAG ! tag:example.com,2000:\n--- !x {kind: Secret, data: {a: LEAK1}}\n',
-            'directive then a plain document': '%YAML 1.1\n---\nkind: Secret\ndata: {a: LEAK1}\n',
-        }.items():
-            text = inspect_ops.redact_manifest(manifest)
-            self.assertNotIn('LEAK1', text, name)
-            self.assertTrue(self.hidden_reason(text), name)
-        self.assertEqual(self.hidden_reason(inspect_ops.redact_manifest('--- {kind: ConfigMap}\n')),
-                         ['# <hidden: document uses YAML directives>'])
-
-    def test_merge_keys_hide_the_document_quoted_or_not(self):
-        for key in ('<<', '"<<"', "'<<'"):
-            for body in ('kind: ConfigMap\nbase: {kind: Secret}\n%s: {kind: Secret}\ndata: {a: LEAK1}\n' % key,
-                         'kind: ConfigMap\ndata:\n  %s: {a: LEAK1}\n' % key):
-                text = self.show(body)
-                self.assertNotIn('LEAK1', text, key)
-                self.assertEqual(self.hidden_reason(text),
-                                 ['# <hidden: document uses YAML aliases, anchors, merge keys or tags>'], key)
-
-    def test_kind_is_compared_case_insensitively(self):
-        for kind in ('secret', 'SECRET', 'Secret', 'sEcReT', ' Secret ', '"secret"'):
-            text = self.show('kind: %s\nmetadata: {name: x}\ndata: {a: LEAK1}\nstringData: {b: LEAK2}\n'
-                             'unknown: LEAK3\n' % kind)
-            self.assertNotIn('LEAK', text, kind)
-            self.assertNotIn('unknown', text, kind)
-            self.assertIn('a: <hidden>', text, kind)
-            self.assertIn('b: <hidden>', text, kind)
-        self.assertNotIn('LEAK', self.show('kind: secretlist\nitems: [{kind: Secret, data: {a: LEAK1}}]\n'))
+    def test_response_shape(self):
+        out = self.shape(KUBECTL_OK)
+        self.assertEqual(list(out), ['name', 'namespace', 'revision', 'status', 'chart', 'chartVersion',
+                                     'objects', 'hidden', 'history', 'appVersion', 'lastDeployed'])
+        self.assertEqual((out['name'], out['namespace'], out['revision'], out['status'], out['chart'],
+                          out['chartVersion'], out['appVersion'], out['lastDeployed']),
+                         ('nvr', 'teknoir-demo', 3, 'deployed', 'nvr', '0.4.2', '1.2.0', '2026-10-02T10:00:00Z'))
+        self.assertEqual(out['hidden'], [])
+        self.assertEqual(out['history'], [{'revision': 3, 'status': 'deployed'},
+                                          {'revision': 2, 'status': 'superseded'}])
+        self.assertNotIn('manifest', out)
+        self.assertEqual(len(out['objects']), 2)
+        self.assertEqual(out['objects'][1], CONFIGMAP_OBJ)          # other kinds are returned as they are
+        self.assertTrue(json.dumps(out))
 
     def test_a_secret_shows_only_its_allowed_fields(self):
-        text = self.show(textwrap.dedent('''\
-            apiVersion: v1
-            kind: secret
-            metadata:
-              name: db
-              namespace: n
-              labels: {app: db}
-              annotations:
-                keep: me
-                kubectl.kubernetes.io/last-applied-configuration: '{"data":{"pw":"LEAK1"}}'
-              managedFields: [{manager: kubectl, fieldsV1: {"f:data": {"f:pw": {}}}}]
-            type: Opaque
-            immutable: true
-            data: {pw: LEAK2, user: LEAK3}
-            stringData: {token: LEAK4}
-            binaryData: {blob: LEAK5}
-            extra: LEAK6
-            Data: {pw: LEAK7}
-            spec: {nested: LEAK8}
-            '''))
-        self.assertNotIn('LEAK', text)
-        self.assertNotIn('last-applied', text)
-        self.assertNotIn('managedFields', text)
-        import yaml
-        obj = list(yaml.safe_load_all(text))[0]
-        self.assertEqual(obj, {
-            'apiVersion': 'v1', 'kind': 'secret',
-            'metadata': {'name': 'db', 'namespace': 'n', 'labels': {'app': 'db'}, 'annotations': {'keep': 'me'}},
+        secret = self.objects(dict(SECRET_OBJ, binaryData={'b': 'QUJD'}, immutable=True,
+                                   foo='LEAK-top', Data={'x': 'LEAK-case'}))[0]
+        self.assertEqual(secret, {
+            'apiVersion': 'v1', 'kind': 'Secret', 'metadata': {'name': 'nvr-db', 'namespace': 'teknoir-demo'},
             'type': 'Opaque', 'immutable': True,
-            'data': {'pw': '<hidden>', 'user': '<hidden>'}, 'stringData': {'token': '<hidden>'},
-            'binaryData': {'blob': '<hidden>'}})
-        self.assertEqual(list(obj), ['apiVersion', 'kind', 'metadata', 'type', 'immutable', 'data', 'stringData',
-                                     'binaryData'])
+            'data': {'password': '<hidden>', 'user': '<hidden>'}, 'stringData': {'token': '<hidden>'},
+            'binaryData': {'b': '<hidden>'}})
+        self.assertNotIn('LEAK', json.dumps(secret))
+
+    def test_secret_metadata_drops_managed_fields_and_last_applied_in_any_case(self):
+        meta = {'name': 'n', 'managedFields': [{'fieldsV1': {'f:data': {'f:pw': {}}}, 'manager': 'x'}],
+                'ManagedFields': 'LEAK', 'labels': {'a': 'b'},
+                'annotations': {'Kubectl.Kubernetes.io/Last-Applied-Configuration': 'LEAK',
+                                'note': 'keep'}}
+        secret = self.objects({'apiVersion': 'v1', 'kind': 'Secret', 'metadata': meta})[0]
+        self.assertEqual(secret['metadata'], {'name': 'n', 'labels': {'a': 'b'}, 'annotations': {'note': 'keep'}})
+        only = self.objects({'apiVersion': 'v1', 'kind': 'Secret', 'metadata': {
+            'name': 'n', 'annotations': {'kubectl.kubernetes.io/last-applied-configuration': 'LEAK'}}})[0]
+        self.assertEqual(only['metadata'], {'name': 'n'})
+
+    def test_kind_is_compared_case_insensitively_and_trimmed(self):
+        for kind in ('secret', 'SECRET', 'sEcReT', ' Secret ', 'Secret\t'):
+            obj = self.objects({'apiVersion': 'v1', 'kind': kind, 'metadata': {'name': 'n'},
+                                'data': {'k': 'LEAK'}, 'extra': 'LEAK'})[0]
+            self.assertEqual(obj['data'], {'k': '<hidden>'}, repr(kind))
+            self.assertNotIn('LEAK', json.dumps(obj), repr(kind))
+            self.assertNotIn('extra', obj)
+
+    def test_a_secret_of_any_apiversion_is_reduced(self):
+        obj = self.objects({'apiVersion': 'v2', 'kind': 'Secret', 'data': {'k': 'LEAK'}})[0]
+        self.assertEqual(obj['data'], {'k': '<hidden>'})
 
     def test_a_secret_with_odd_values_for_its_fields(self):
-        for body in ('kind: Secret\ndata: LEAK1\n', 'kind: Secret\ndata: [LEAK1]\n', 'kind: Secret\nstringData: 7\n',
-                     'kind: Secret\nmetadata: LEAK1\n', 'kind: Secret\ntype: {a: LEAK1}\n',
-                     'kind: Secret\nmetadata:\n  annotations: LEAK1\n', 'kind: Secret\ndata: {a: {b: LEAK1}}\n',
-                     'kind: Secret\nimmutable: [LEAK1]\n', 'kind: Secret\nmetadata:\n  Annotations:\n'
-                     '    kubectl.kubernetes.io/last-applied-configuration: LEAK1\n',
-                     'kind: Secret\nmetadata:\n  annotations:\n'
-                     '    Kubectl.Kubernetes.Io/Last-Applied-Configuration: LEAK1\n'):
-            text = self.show(body)
-            self.assertNotIn('LEAK1', text, body)
-            self.assertEqual(self.hidden_reason(text), [], body)
+        obj = self.objects({'apiVersion': 'v1', 'kind': 'Secret', 'metadata': 'LEAK-meta',
+                            'type': {'LEAK': 1}, 'immutable': ['LEAK'], 'data': 'LEAK-text',
+                            'stringData': ['LEAK'], 'binaryData': None})[0]
+        self.assertEqual(obj, {'apiVersion': 'v1', 'kind': 'Secret', 'data': '<hidden>',
+                               'stringData': '<hidden>', 'binaryData': '<hidden>'})
 
-    def test_top_level_keys_that_could_fold_to_kind_or_items_hide_the_document(self):
-        # Go decoders match field names case-insensitively, and fold some non-ASCII letters to ASCII
-        for key in ('Kind', 'KIND', 'kInD', 'Items', 'ITEMS', 'items', '\u0131tems', '\u212aind', 'kind\u0131',
-                    '\u017ftringData', 'data\u200b'):
-            text = self.show('kind: ConfigMap\n%s: Secret\ndata: {a: LEAK1}\n' % key)
-            self.assertNotIn('LEAK1', text, key)
-            self.assertEqual(len(self.hidden_reason(text)), 1, key)
-        # non-ASCII below the top level is fine
-        text = self.show('kind: ConfigMap\ndata: {caf\u00e9: ok}\n')
-        self.assertEqual(self.hidden_reason(text), [])
-        self.assertIn('caf\\xE9": ok', text)
+    def test_a_secret_value_never_reaches_the_result_in_any_position(self):
+        out = self.shape(kubectl_out(SECRET_OBJ, CONFIGMAP_OBJ, {'apiVersion': 'v1', 'kind': 'List', 'items': [
+            SECRET_OBJ, {'apiVersion': 'v1', 'kind': 'List', 'items': [SECRET_OBJ]}]}))
+        blob = json.dumps(out)
+        for leaked in ('aHVudGVyMg', 'YWRtaW4', 'plain-text-token', 'c3VwZXI', 'last-applied'):
+            self.assertNotIn(leaked, blob)
+        self.assertEqual([o['kind'] for o in out['objects']], ['Secret', 'ConfigMap', 'Secret', 'Secret'])
 
-    def test_keys_must_be_unique_plain_strings(self):
-        for body in ('kind: ConfigMap\nkind: Secret\ndata: {a: LEAK1}\n',
-                     'kind: Secret\ndata: {a: LEAK1}\ndata: {b: x}\n',
-                     'kind: ConfigMap\ndata: {a: LEAK1, a: x}\n',
-                     'kind: ConfigMap\ndata: {"a": LEAK1, a: x}\n',
-                     'kind: ConfigMap\ndata:\n  1: LEAK1\n', 'kind: ConfigMap\ndata:\n  null: LEAK1\n',
-                     'kind: ConfigMap\ndata:\n  ~: LEAK1\n', 'kind: ConfigMap\ndata:\n  true: LEAK1\n',
-                     'kind: ConfigMap\ndata:\n  1.5: LEAK1\n', 'kind: ConfigMap\ndata:\n  ? [a]\n  : LEAK1\n',
-                     'kind: ConfigMap\ndata:\n  ? {a: b}\n  : LEAK1\n', 'kind: ConfigMap\ndata:\n  ?\n  : LEAK1\n',
-                     '1: x\nkind: ConfigMap\ndata: {a: LEAK1}\n', '? [a]\n: b\nkind: ConfigMap\ndata: {a: LEAK1}\n'):
-            text = self.show(body)
-            self.assertNotIn('LEAK1', text, body)
-            self.assertEqual(self.hidden_reason(text), ['# <hidden: document is not a plain Kubernetes object>'], body)
-        self.assertEqual(self.hidden_reason(self.show('kind: ConfigMap\ndata: {"1": a, "true": b}\n')), [])
+    def test_lists_are_flattened_nested_ones_too(self):
+        inner = {'apiVersion': 'v1', 'kind': 'List', 'items': [CONFIGMAP_OBJ]}
+        out = self.shape(json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': [SECRET_OBJ, inner, inner]}))
+        self.assertEqual([o['kind'] for o in out['objects']], ['Secret', 'ConfigMap', 'ConfigMap'])
+        self.assertEqual(out['objects'][0]['data'], {'password': '<hidden>', 'user': '<hidden>'})
+        # an empty List
+        self.assertEqual(self.shape('{"apiVersion":"v1","kind":"List","items":[]}')['objects'], [])
 
-    def test_the_kind_must_be_a_plain_string_and_not_a_list_kind(self):
-        for body in ('data: {a: LEAK1}\n', 'kind: 7\ndata: {a: LEAK1}\n', 'kind: null\ndata: {a: LEAK1}\n',
-                     'kind:\ndata: {a: LEAK1}\n', 'kind: [Secret]\ndata: {a: LEAK1}\n',
-                     'kind: {a: b}\ndata: {a: LEAK1}\n', 'kind: true\ndata: {a: LEAK1}\n',
-                     'kind: List\nitems: [{kind: Secret, data: {a: LEAK1}}]\n',
-                     'kind: SecretList\ndata: {a: LEAK1}\n', 'kind: secretlist\ndata: {a: LEAK1}\n',
-                     'kind: ConfigMapLIST\ndata: {a: LEAK1}\n', 'kind: ConfigMap\nitems: []\nx: LEAK1\n'):
-            text = self.show(body)
-            self.assertNotIn('LEAK1', text, body)
-            self.assertIn(self.hidden_reason(text), (['# <hidden: document is a list>'],
-                                                     ['# <hidden: document is not a plain Kubernetes object>']), body)
+    def test_any_object_with_an_items_array_is_flattened_like_kubectl_does(self):
+        out = self.shape(json.dumps({'apiVersion': 'v1', 'kind': 'SecretList', 'items': [SECRET_OBJ]}))
+        self.assertEqual(len(out['objects']), 1)
+        self.assertEqual(out['objects'][0]['data'], {'password': '<hidden>', 'user': '<hidden>'})
+        out = self.shape(json.dumps({'apiVersion': 'v1', 'kind': 'ConfigMap', 'data': {'LEAK': 'x'},
+                                     'items': [CONFIGMAP_OBJ]}))
+        self.assertEqual(out['objects'], [CONFIGMAP_OBJ])        # the wrapper is not shown, only its members
 
-    def test_documents_that_are_not_mappings_are_hidden(self):
-        for body in ('- kind: Secret\n  data: {a: LEAK1}\n', 'LEAK1 as a scalar\n', '"LEAK1"\n', '[LEAK1]\n', '7\n',
-                     'null\n'):
-            text = self.show(body)
-            self.assertNotIn('LEAK1', text, body)
-            self.assertEqual(self.hidden_reason(text), ['# <hidden: document is not a plain Kubernetes object>'], body)
+    def test_lists_nested_too_deep_are_hidden(self):
+        value = SECRET_OBJ
+        for _ in range(inspect_ops.MAX_LIST_DEPTH + 3):
+            value = {'apiVersion': 'v1', 'kind': 'List', 'items': [value]}
+        out = self.shape(json.dumps(value))
+        self.assertEqual(out['objects'], [])
+        self.assertEqual(len(out['hidden']), 1)
+        self.assertNotIn('aHVudGVyMg', json.dumps(out))
 
-    def test_more_than_one_yaml_document_in_a_chunk_is_hidden(self):
-        for body in ('kind: ConfigMap\n...\nkind: Secret\ndata: {a: LEAK1}\n',
-                     'kind: ConfigMap\n--- !x\nkind: Secret\ndata: {a: LEAK1}\n',
-                     'kind: ConfigMap\n...\n--- !!map\nkind: Secret\ndata: {a: LEAK1}\n'):
-            text = self.show(body)
-            self.assertNotIn('LEAK1', text, body)
-            self.assertIn(self.hidden_reason(text), (['# <hidden: document is not a plain Kubernetes object>'],
-                                                     ['# <hidden: document could not be parsed>'],
-                                                     ['# <hidden: document uses YAML directives>']), body)
+    def test_one_object_a_list_or_a_stream_of_objects(self):
+        for text in (json.dumps(CONFIGMAP_OBJ), json.dumps(CONFIGMAP_OBJ, indent=4),
+                     json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': [CONFIGMAP_OBJ]}),
+                     '  \n' + kubectl_out(CONFIGMAP_OBJ) + '\n\n'):
+            self.assertEqual(self.shape(text)['objects'], [CONFIGMAP_OBJ], text)
+        self.assertEqual(len(self.shape(kubectl_out(*[CONFIGMAP_OBJ] * 50))['objects']), 50)
 
-    def test_nested_lists_and_items_are_hidden(self):
-        secret = '{kind: Secret, data: {password: LEAK1}, stringData: {token: LEAK2}}'
-        for body in ('kind: List\nitems:\n- - %s\n' % secret, 'kind: ConfigMap\ndata: [[%s]]\n' % secret,
-                     'kind: Deployment\nspec:\n  x:\n  - - %s\n' % secret, 'kind: ConfigMap\nx: [[[%s]]]\n' % secret,
-                     'kind: Whatever\nitems: [%s]\n' % secret, 'kind: Secret\ndata: {a: LEAK1}\nitems: [x]\n',
-                     'items: [%s]\n' % secret, 'kind: ConfigMap\nITEMS: [%s]\n' % secret,
-                     'kind: SecretList\nitems: [%s]\n' % secret):
-            text = self.show(body)
-            self.assertNotIn('LEAK', text, body)
-            self.assertEqual(len(self.hidden_reason(text)), 1, body)
-            self.assertNotIn('kind:', text, body)
-        self.assertEqual(self.hidden_reason(self.show('kind: ConfigMap\nx: [{a: [1]}, [2][0]]\n'))[:1],
-                         ['# <hidden: document is a list>'])
+    def test_things_that_are_not_objects_are_hidden(self):
+        out = self.shape('[1, 2] "text" 7 {"kind": 7, "data": {"k": "LEAK"}} {"data": {"k": "LEAK"}} '
+                         + json.dumps(CONFIGMAP_OBJ))
+        self.assertEqual(out['objects'], [CONFIGMAP_OBJ])
+        self.assertEqual(len(out['hidden']), 2)
+        self.assertNotIn('LEAK', json.dumps(out))
 
-    def test_a_hidden_document_does_not_stop_the_others(self):
-        text = inspect_ops.redact_manifest(
-            '---\nkind: List\nitems: [[LEAK1]]\n---\nkind: ConfigMap\ndata: {a: shown}\n'
-            '---\nkind: Secret\ndata: {a: LEAK2}\n---\n&a x: y\n---\nkind: Service\n')
-        self.assertNotIn('LEAK', text)
-        self.assertIn('a: shown', text)
-        self.assertIn('a: <hidden>', text)
-        self.assertIn('kind: Service', text)
-        self.assertEqual(len(self.hidden_reason(text)), 2)
+    def test_partial_output_with_a_nonzero_exit_reports_what_failed(self):
+        err = ('error: resource mapping not found for name: "c" namespace: "" from "STDIN": no matches for '
+               'kind "Foo" in version "x/v1"\nensure CRDs are installed first\n'
+               'E1022 14:42:47.951670 1957530 memcache.go:265] "Unhandled Error" err="LEAK-noise"\n')
+        out = self.shape(kubectl_out(SECRET_OBJ, CONFIGMAP_OBJ), rc=1, err=err)
+        self.assertEqual([o['kind'] for o in out['objects']], ['Secret', 'ConfigMap'])
+        self.assertEqual(out['hidden'], [
+            {'reason': 'an object of the unknown kind Foo (its CRD is not installed on the robot)'}])
+        self.assertNotIn('LEAK', json.dumps(out))
+        # no error line at all
+        out = self.shape(kubectl_out(CONFIGMAP_OBJ), rc=1)
+        self.assertEqual(out['hidden'], [{'reason': 'kubectl stopped before the end of the manifest (exit 1)'}])
 
-    def test_the_hidden_placeholders_carry_no_content(self):
-        text = self.show('kind: Secret\ndata: &d {a: LEAK1}\n')
-        self.assertEqual(text, '# comments are not shown\n---\n# <hidden: document uses YAML aliases, anchors, merge keys or tags>\n')
+    def test_hidden_reasons_are_fixed_sentences_never_copied_values(self):
+        err = ('error: error parsing STDIN: error converting YAML to JSON: yaml: unmarshal errors:\n'
+               '  line 4: cannot unmarshal !!str `hunter2` into map[string]interface {}\n'
+               'error: Object \'Kind\' is missing in \'{"data":{"password":"hunter2"}}\'\n'
+               'Error from server (Forbidden): secrets is forbidden: User "hunter2"\n'
+               'unable to recognize "STDIN": no matches for kind "hunter2 and more" in version "v1"\n'
+               'hunter2 is not an error line\n')
+        out = self.shape(kubectl_out(CONFIGMAP_OBJ), rc=1, err=err)
+        blob = json.dumps(out)
+        self.assertNotIn('hunter2', blob)
+        reasons = [h['reason'] for h in out['hidden']]
+        self.assertIn('a document is not valid YAML', reasons)
+        self.assertIn('a document has no apiVersion or kind', reasons)
+        self.assertEqual(len(reasons), len(set(reasons)))
+        self.assertLessEqual(len(reasons), inspect_ops.MAX_HIDDEN)
+        many = '\n'.join('error: resource mapping not found: no matches for kind "K%d" in version "v1"' % i
+                         for i in range(20))
+        out = self.shape(kubectl_out(CONFIGMAP_OBJ), rc=1, err=many)
+        self.assertEqual(len(out['hidden']), inspect_ops.MAX_HIDDEN)
 
-    def test_without_libyaml_every_document_is_hidden_and_the_listener_stays_off(self):
-        orig = inspect_ops._YAML_LOADER
-        inspect_ops._YAML_LOADER = None
-        self.addCleanup(setattr, inspect_ops, '_YAML_LOADER', orig)
-        text = inspect_ops.redact_manifest(MANIFEST)
-        self.assertNotIn('LOG_LEVEL', text)
-        self.assertEqual(len(self.hidden_reason(text)), 4)
-        self.assertIsNone(inspect_ops.start_inspect_listener(None, [PRINCIPAL], 0))
+    def test_cut_output_after_the_last_object_is_reported(self):
+        out = self.shape(kubectl_out(CONFIGMAP_OBJ) + '{"apiVersion": "v1", "kind": "Secret", "data": {"k": "LE')
+        self.assertEqual(out['objects'], [CONFIGMAP_OBJ])
+        self.assertEqual(out['hidden'], [{'reason': 'the rest of the kubectl output could not be read'}])
+        self.assertNotIn('LE', json.dumps(out['hidden']))
 
-    def test_the_parser_is_libyaml(self):
-        self.assertIs(inspect_ops._YAML_LOADER, inspect_ops.yaml.CSafeLoader)
-
-    def test_redacted_manifest_over_cap(self):
-        doc = '---\nkind: ConfigMap\ndata:\n  k: "%s"\n' % ('x' * 100000)
-        manifest = doc * (inspect_ops.MANIFEST_CAP // len(doc) + 2)
+    def test_garbage_output_is_release_unparsable(self):
+        for out, rc, err in (('this is not json', 0, ''), ('<html>nope</html>', 1, 'error: boom'),
+                             ('', 0, ''), ('', 1, 'error: error parsing STDIN: yaml: line 2: did not find '
+                                                  'expected node content\n'),
+                             ('{"kind": ', 1, '')):
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                self.shape(out, rc=rc, err=err)
+            self.assertEqual(cm.exception.code, 'release_unparsable', (out, rc))
+            self.assertIn('could not be decoded', cm.exception.message)
         with self.assertRaises(inspect_ops.Failure) as cm:
-            inspect_ops.redact_manifest(manifest)
+            self.shape('', rc=1, err='error: error parsing STDIN: cannot unmarshal !!str `hunter2`')
+        self.assertNotIn('hunter2', cm.exception.message)
+        self.assertEqual(inspect_ops.STATUS['release_unparsable'], 502)
+
+    def test_a_manifest_without_objects_is_an_empty_release(self):
+        out = self.shape('', rc=1, err='error: no objects passed to create\n')
+        self.assertEqual((out['objects'], out['hidden']), ([], []))
+
+    def test_an_api_server_that_does_not_answer_is_a_device_error(self):
+        for err in ('unable to recognize "STDIN": Get "https://127.0.0.1:6443/api?timeout=15s": dial tcp '
+                    '127.0.0.1:6443: connect: connection refused',
+                    'error: ... context deadline exceeded'):
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                self.shape('', rc=1, err=err)
+            self.assertEqual(cm.exception.code, 'device_error')
+
+    def test_too_many_objects_and_too_complex_output_are_too_large(self):
+        for n in (inspect_ops.RELEASE_MAX_OBJECTS + 1,):
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                self.shape(json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': [CONFIGMAP_OBJ] * n}))
+            self.assertEqual(cm.exception.code, 'too_large')
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                self.shape(' '.join(['{"kind":"A"}'] * n))
+            self.assertEqual(cm.exception.code, 'too_large')
+        self.assertEqual(len(self.shape(json.dumps({'apiVersion': 'v1', 'kind': 'List',
+                                                    'items': [CONFIGMAP_OBJ] * inspect_ops.RELEASE_MAX_OBJECTS}
+                                                   ))['objects']), inspect_ops.RELEASE_MAX_OBJECTS)
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            self.shape('{"kind":"A","x":[' + '{},' * 250000 + '{}]}')
         self.assertEqual(cm.exception.code, 'too_large')
 
-    def test_a_document_over_the_cap_is_hidden_unparsed(self):
-        orig = inspect_ops.yaml.parse
+    def test_deeply_nested_output_never_crashes(self):
+        # nested past what the parser may recurse into: too_large before json sees it (a segfault
+        # on a small thread stack otherwise); nested past what is shown: the object is hidden
+        for depth in (inspect_ops.JSON_MAX_DEPTH + 1, 1000, 150000):
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                self.on_small_stack(self.shape, '{"kind":"A","x":' + '[' * depth + ']' * depth + '}')
+            self.assertEqual(cm.exception.code, 'too_large', depth)
+        for depth, shown in ((inspect_ops.MAX_OBJECT_DEPTH - 3, True), (inspect_ops.MAX_OBJECT_DEPTH + 10, False),
+                             (inspect_ops.JSON_MAX_DEPTH - 5, False)):
+            deep = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'data': {}}
+            node = deep['data']
+            for _ in range(depth):
+                node['k'] = {}
+                node = node['k']
+            out = self.on_small_stack(self.shape, json.dumps(deep) + json.dumps(CONFIGMAP_OBJ))
+            self.assertEqual(len(out['objects']), 2 if shown else 1, depth)
+            self.assertEqual(out['hidden'], [] if shown else [{'reason': 'an object nested too deep'}])
+            json.dumps(out)
 
-        def boom(*a, **k):
-            raise AssertionError('parsed')
-        inspect_ops.yaml.parse = boom
-        try:
-            for kind in ('Secret', 'ConfigMap'):
-                body = 'kind: %s\ndata:\n  a: LEAK1\n  pad: "%s"\n' % (kind, 'x' * inspect_ops.DOC_CAP)
-                text = self.show(body)
-                self.assertNotIn('LEAK1', text)
-                self.assertEqual(self.hidden_reason(text), ['# <hidden: document is too large to show>'])
-        finally:
-            inspect_ops.yaml.parse = orig
-        small = self.show('kind: Secret\ndata:\n  a: LEAK1\n')
-        self.assertIn('a: <hidden>', small)
+    def test_json_depth_check_ignores_brackets_in_strings(self):
+        deep_text = json.dumps({'kind': 'A', 'x': '[' * 5000 + '{' * 5000, 'y': '\\"' + '[' * 5000})
+        self.assertFalse(inspect_ops.json_too_deep(deep_text.encode()))
+        self.assertTrue(inspect_ops.json_too_deep(b'[' * 201 + b']' * 201))
+        self.assertFalse(inspect_ops.json_too_deep(b'[' * 200 + b']' * 200))
+        self.assertEqual(self.shape(deep_text)['objects'][0]['kind'], 'A')
 
-    def test_deep_documents_are_hidden_and_never_recurse(self):
-        for depth in (70, 5000, 20000):
-            for name, doc in (
-                    ('maps', 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * depth + '1' + '}' * depth + '\n'),
-                    ('block maps', 'kind: ConfigMap\nx:\n' + ''.join('%sa:\n' % (' ' * (i + 1)) for i in range(min(depth, 300)))
-                     + ' ' * 400 + 'b: LEAK1\n'),
-                    ('lists', 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '[' * depth + ']' * depth + '\n'),
-                    ('lists of maps', 'kind: ConfigMap\nx: ' + '[{a: ' * depth + '1' + '}]' * depth + '\n')):
-                text = self.on_small_stack(inspect_ops.redact_manifest, '---\n' + doc)
-                self.assertNotIn('LEAK1', text, (name, depth))
-                self.assertEqual(len(self.hidden_reason(text)), 1, (name, depth))
+    def test_the_budget_stops_the_shaping(self):
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            self.shape(KUBECTL_OK, budget=-1)
+        self.assertEqual(cm.exception.code, 'too_large')
 
-    def test_moderate_nesting_is_shown(self):
-        nested = 'x: ' + '{a: ' * 30 + '1' + '}' * 30 + '\n'
-        text = self.on_small_stack(inspect_ops.redact_manifest, '---\nkind: Secret\ndata: {a: LEAK1}\n' + nested)
-        self.assertNotIn('LEAK1', text)
-        self.assertEqual(self.hidden_reason(text), [])
-        self.assertIn('a: <hidden>', text)
+    def test_no_yaml_is_parsed_here(self):
+        # the manifest is Kubernetes' business; nothing in this module reads YAML
+        self.assertFalse(hasattr(inspect_ops, 'yaml'))
+        self.assertFalse(hasattr(inspect_ops, 'redact_manifest'))
 
-    def test_deep_secret_in_a_release_is_survived(self):
-        doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * 1000 + '1' + '}' * 1000 + '\n'
-        out = self.on_small_stack(
-            inspect_ops.shape_release, helm_release('---\n' + doc), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3)
-        self.assertNotIn('LEAK1', out['manifest'])
-        self.assertIn('document is too deep to show', out['manifest'])
+    def test_manifest_argv_is_the_fixed_command(self):
+        req = inspect_ops.parse_request({'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr',
+                                         'revision': 2})
+        argv = inspect_ops.kubectl_manifest_argv(req)
+        self.assertEqual(argv, ['sudo', '-n', 'k3s', 'kubectl', '--request-timeout=15s', '-n', 'teknoir-demo',
+                                'create', '--dry-run=client', '--validate=false', '-o', 'json', '-f', '-'])
+        self.assertEqual(shlex.split(inspect_ops.remote_command(argv)), argv)
 
-    def test_large_documents_stay_within_memory_and_time(self):
-        # Documents are built into objects now, so the per-document cap is what bounds them: just
-        # under the cap (shown) and just over it (hidden unparsed), with many tiny documents too.
-        probe = textwrap.dedent('''\
-            import resource, sys, time
-            sys.path.insert(0, sys.argv[1])
-            import inspect_ops
-            variant = sys.argv[2]
-            cap = inspect_ops.DOC_CAP
-            if variant == 'flow':
-                body = 'kind: ConfigMap\\nx: [' + ','.join(['1'] * (cap // 2 - 20)) + ']\\n'
-            elif variant == 'block':
-                body = 'kind: ConfigMap\\nx:\\n' + '- {a: b}\\n' * (cap // 9 - 10)
-            elif variant == 'over':
-                body = 'kind: ConfigMap\\nx:\\n' + '- a\\n' * (cap // 4 + 10)
-            else:    # many tiny documents
-                body = '---\\n'.join('kind: ConfigMap\\n' for _ in range(50000))
-            manifest = '---\\n' + body
-            assert len(manifest) <= inspect_ops.MANIFEST_CAP, len(manifest)
-            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            started = time.monotonic()
-            try:
-                out = inspect_ops.redact_manifest(manifest, time.monotonic() + 30)
-                ok = ('hidden: document is too large' in out) if variant == 'over' else out.startswith('# comments')
-            except inspect_ops.Failure as f:
-                ok = f.code == 'too_large' and variant == 'tiny'
-            after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            print(ok, (after - before) // 1024, round(time.monotonic() - started, 2))
-        ''')
-        app_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app')
-        for variant in ('flow', 'block', 'over', 'tiny'):
-            out = subprocess.run([sys.executable, '-c', probe, app_dir, variant], capture_output=True,
-                                 text=True, timeout=120, check=True).stdout.split()
-            self.assertEqual(out[0], 'True', variant)
-            self.assertLess(int(out[1]), 80, '%s grew by %s MiB' % (variant, out[1]))
-            self.assertLess(float(out[2]), 10, '%s took %s s' % (variant, out[2]))
+    def decode(self, data, rev=3, name='nvr', ns='teknoir-demo', **kw):
+        return inspect_ops.decode_checked(data, name, ns, rev, **kw)
 
     def test_decode_drops_everything_else(self):
-        rows = [(3, 'deployed'), (2, 'superseded'), (1, 'superseded')]
         for gz in (True, False):
-            out = inspect_ops.shape_release(helm_release(MANIFEST, gz=gz), rows, 'nvr', 'teknoir-demo', 3)
+            kept, manifest = self.decode(helm_release(MANIFEST, gz=gz))
+            self.assertEqual(manifest, MANIFEST.encode())
+            self.assertEqual(set(kept), {'name', 'namespace', 'version', 'status', 'last_deployed', 'chart',
+                                         'chartVersion', 'appVersion', 'manifest'})
+            out = inspect_ops.shape_release_objects(kept, [(3, 'deployed'), (2, 'superseded'), (1, 'superseded')],
+                                                    'nvr', 'teknoir-demo', 3, 0, KUBECTL_OK.encode(), b'')
             self.assertEqual(set(out), {'name', 'namespace', 'revision', 'status', 'chart', 'chartVersion',
-                                        'appVersion', 'lastDeployed', 'manifest', 'history'})
-            self.assertEqual((out['name'], out['revision'], out['status'], out['chart'], out['chartVersion'],
-                              out['appVersion'], out['lastDeployed']),
-                             ('nvr', 3, 'deployed', 'nvr', '0.4.2', '1.2.0', '2026-10-02T10:00:00Z'))
+                                        'appVersion', 'lastDeployed', 'objects', 'hidden', 'history'})
             self.assertEqual(out['history'][0], {'revision': 3, 'status': 'deployed'})
             blob = json.dumps(out)
-            for leaked in ('hunter2', 'chart-default-pw', 'SECRET NOTE', 'secret-hook', 'templates/x.yaml'):
+            for leaked in ('hunter2', 'chart-default-pw', 'SECRET NOTE', 'secret-hook', 'templates/x.yaml',
+                           'aHVudGVyMg'):
                 self.assertNotIn(leaked, blob)
+
+    def test_the_manifest_is_decoded_byte_for_byte(self):
+        odd = 'a: 1\r\n\ufeffb: \u0085c\u2028d\x00\U0001F600 \u00e5\n--- #x\n'
+        _, manifest = self.decode(helm_release(odd))
+        self.assertEqual(manifest, odd.encode('utf-8'))
+        with self.assertRaises(inspect_ops.Failure) as cm:      # a lone surrogate has no UTF-8 form
+            self.decode(helm_release('a: \ud800'))
+        self.assertEqual(cm.exception.code, 'device_error')
 
     def test_history_capped_at_20(self):
         rows = [(i, 'superseded') for i in range(30, 0, -1)]
-        self.assertEqual(len(inspect_ops.shape_release(helm_release(MANIFEST), rows, 'nvr', 'teknoir-demo', 3)['history']), 20)
+        out = inspect_ops.shape_release_objects(self.KEPT, rows, 'nvr', 'teknoir-demo', 3, 0, KUBECTL_OK.encode(), b'')
+        self.assertEqual(len(out['history']), 20)
 
     def test_gzip_bomb_is_too_large(self):
         bomb = gzip.compress(b'{"manifest": "' + b'a' * (inspect_ops.RELEASE_JSON_CAP + 1000) + b'"}', 1)
@@ -1037,23 +813,15 @@ class TestRelease(unittest.TestCase):
             inspect_ops.decode_release(data)
         self.assertEqual(cm.exception.code, 'too_large')
 
-    def test_large_manifest_fails_fast_before_parsing(self):
-        # compressible and over the cap: must be refused without splitting or parsing it
+    def test_large_manifest_fails_fast_before_it_is_sent(self):
+        # compressible and over the cap: refused when the record is decoded, nothing goes to the robot
         doc = '---\nkind: ConfigMap\ndata:\n  k: "%s"\n' % ('x' * 1000)
         manifest = doc * ((inspect_ops.MANIFEST_CAP // len(doc)) + 10)
         data = helm_release(manifest)
         self.assertLess(len(data), 200000)
-        orig = inspect_ops.redact_manifest
-
-        def boom(_):
-            raise AssertionError('manifest was parsed')
-        inspect_ops.redact_manifest = boom
-        try:
-            started = time.monotonic()
-            with self.assertRaises(inspect_ops.Failure) as cm:
-                inspect_ops.shape_release(data, [(3, 'deployed')], 'nvr', 'teknoir-demo', 3)
-        finally:
-            inspect_ops.redact_manifest = orig
+        started = time.monotonic()
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            self.decode(data)
         self.assertEqual(cm.exception.code, 'too_large')
         self.assertLess(time.monotonic() - started, 2)
 
@@ -1092,29 +860,23 @@ class TestRelease(unittest.TestCase):
             inspect_ops._json('[' * 300000 + ']' * 300000)
         self.assertIn(cm.exception.code, ('too_large', 'device_error'))
 
-    def test_budget_stops_the_redaction(self):
-        manifest = ''.join('---\nkind: ConfigMap\nmetadata: {name: n%d}\n' % i for i in range(2000))
+    def test_budget_stops_the_decoding(self):
         with self.assertRaises(inspect_ops.Failure) as cm:
-            inspect_ops.redact_manifest(manifest, deadline=time.monotonic() - 1)
-        self.assertEqual(cm.exception.code, 'too_large')
-        with self.assertRaises(inspect_ops.Failure) as cm:
-            inspect_ops.shape_release(helm_release(manifest), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3,
-                                      budget=-1)
+            self.decode(helm_release(MANIFEST), budget=-1)
         self.assertEqual(cm.exception.code, 'too_large')
 
     def test_release_must_match_the_request(self):
-        rows = [(3, 'deployed')]
-        ok = inspect_ops.shape_release(helm_release(MANIFEST), rows, 'nvr', 'teknoir-demo', 3)
-        self.assertIs(type(ok['revision']), int)
+        ok, _ = self.decode(helm_release(MANIFEST))
+        self.assertIs(type(ok['version']), int)
         for name, ns, rev in (('other', 'teknoir-demo', 3), ('nvr', 'elsewhere', 3), ('nvr', 'teknoir-demo', 2)):
             with self.assertRaises(inspect_ops.Failure) as cm:
-                inspect_ops.shape_release(helm_release(MANIFEST), rows, name, ns, rev)
+                self.decode(helm_release(MANIFEST), rev=rev, name=name, ns=ns)
             self.assertEqual(cm.exception.code, 'device_error', (name, ns, rev))
         for version in (None, '3', 3.0, True):
             data = helm_release(MANIFEST, version=version)
             for rev in (3, 1):
                 with self.assertRaises(inspect_ops.Failure) as cm:
-                    inspect_ops.shape_release(data, rows, 'nvr', 'teknoir-demo', rev)
+                    self.decode(data, rev=rev)
                 self.assertEqual(cm.exception.code, 'device_error', version)
 
     def test_object_dense_release_json_is_too_large(self):
@@ -1350,6 +1112,11 @@ class TestEndpoint(InspectHTTPBase):
         self.addCleanup(release.set)
         return release
 
+    @staticmethod
+    def _release_job(runner):
+        return runner._run_job(runner.pool, '_jobs', inspect_ops.MAX_RELEASE_JOBS,
+                               lambda: inspect_ops.decode_checked('x', 'nvr', 'teknoir-demo', 3))
+
     def test_job_slots_of_cancelled_queued_jobs_are_given_back(self):
         # The op's 20 s wait_for cancels a job that is still queued behind a running one. Such a job
         # never runs, so only the submitted future can give its slot back.
@@ -1360,8 +1127,7 @@ class TestEndpoint(InspectHTTPBase):
             seen = []
             for _ in range(inspect_ops.MAX_RELEASE_JOBS + 3):
                 with self.assertRaises(asyncio.TimeoutError):     # busy would be a Failure instead
-                    await asyncio.wait_for(runner._shape_release(asyncio.get_running_loop(), 'x', [], 'nvr',
-                                                                 'teknoir-demo', 3), 0.05)
+                    await asyncio.wait_for(self._release_job(runner), 0.05)
                 seen.append(runner._jobs)
             return seen
         self.assertEqual(self.io_loop.run_sync(go), [0] * (inspect_ops.MAX_RELEASE_JOBS + 3))
@@ -1369,20 +1135,19 @@ class TestEndpoint(InspectHTTPBase):
     def test_job_slot_of_a_running_job_is_held_until_it_ends(self):
         runner = self.app.settings['inspect_runner']
         release, started = threading.Event(), threading.Event()
-        orig = inspect_ops.shape_release
+        orig = inspect_ops.decode_checked
 
         def slow(*a, **k):
             started.set()
             release.wait(20)
             return {'ok': True}
-        inspect_ops.shape_release = slow
-        self.addCleanup(setattr, inspect_ops, 'shape_release', orig)
+        inspect_ops.decode_checked = slow
+        self.addCleanup(setattr, inspect_ops, 'decode_checked', orig)
         self.addCleanup(release.set)
 
         async def go():
             with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(runner._shape_release(asyncio.get_running_loop(), 'x', [], 'nvr',
-                                                             'teknoir-demo', 3), 0.3)
+                await asyncio.wait_for(self._release_job(runner), 0.3)
             return started.is_set(), runner._jobs
         self.assertEqual(self.io_loop.run_sync(go), (True, 1))     # cancelled but still running
         release.set()
@@ -1425,6 +1190,7 @@ class TestEndpoint(InspectHTTPBase):
              'stderr': 'Defaulted container "nvr" out of: nvr, side\n'},
             {'match': 'get secrets -l', 'stdout': '2\tsuperseded\n3\tdeployed\n'},
             {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': rel},
+            {'match': CREATE, 'stdout': KUBECTL_OK},
         ]})
         data = self.body_of(self.post(dict(self.POD, op='events')))
         self.assertEqual(data['result']['events'][0]['reason'], 'BackOff')
@@ -1433,6 +1199,8 @@ class TestEndpoint(InspectHTTPBase):
         self.assertEqual(data['result']['lines'], 1)
         data = self.body_of(self.post({'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}))
         self.assertEqual(data['result']['revision'], 3)
+        self.assertNotIn('manifest', data['result'])
+        self.assertEqual(len(data['result']['objects']), 2)
         self.assertNotIn('hunter2', json.dumps(data))
         self.assertNotIn('aHVudGVyMg', json.dumps(data))
 
@@ -1440,6 +1208,7 @@ class TestEndpoint(InspectHTTPBase):
         self.scenario({'ops': [
             {'match': 'get secrets -l', 'stdout': '1\tsuperseded\n2\tdeployed\n'},
             {'match': 'sh.helm.release.v1.nvr.v1', 'stdout': helm_release(MANIFEST, version=1, status='superseded', namespace='n')},
+            {'match': CREATE, 'stdout': KUBECTL_OK},
         ]})
         body = {'v': 1, 'op': 'release', 'namespace': 'n', 'release': 'nvr', 'revision': 1}
         self.assertEqual(self.body_of(self.post(body))['result']['revision'], 1)
@@ -1447,6 +1216,120 @@ class TestEndpoint(InspectHTTPBase):
         self.scenario({'ops': [{'match': 'get secrets -l', 'stdout': ''}]})
         self.err(self.post(dict(body, revision=1)), 404, 'not_found')
         self.err(self.post({'v': 1, 'op': 'release', 'namespace': 'n', 'release': 'nvr'}), 404, 'not_found')
+
+    REL = {'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}
+    K = 'sudo -n k3s kubectl --request-timeout=15s'
+
+    def release_scenario(self, create, manifest=MANIFEST):
+        self.scenario({'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(manifest)},
+            dict({'match': CREATE}, **create),
+        ]})
+
+    def create_calls(self):
+        return [c for c in self.op_calls() if CREATE in c['argv'][-1]]
+
+    def test_release_manifest_goes_to_the_fixed_command_on_stdin_byte_for_byte(self):
+        odd = MANIFEST + 'x: "a\r\nb \u00e5 \U0001F600 \u2028 \ufeff"\r\n--- #c\r\n# $(touch /tmp/x) `id` ; \'"\n'
+        self.release_scenario({'stdout': KUBECTL_OK}, odd)
+        data = self.body_of(self.post(self.REL))
+        calls = self.create_calls()
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(base64.b64decode(call['stdin_b64']), odd.encode('utf-8'))
+        # the remote command is exactly the fixed one: the manifest is in no argument, nowhere
+        self.assertEqual(call['argv'][-1], self.K + ' -n teknoir-demo create --dry-run=client --validate=false '
+                                                    '-o json -f -')
+        self.assertEqual(call['argv'][-2], '--')
+        for arg in call['argv']:
+            self.assertNotIn('touch', arg)
+            self.assertNotIn('Source: nvr', arg)
+        # the other ops of the release never get a stdin
+        for c in self.op_calls():
+            if CREATE not in c['argv'][-1]:
+                self.assertNotIn('stdin_b64', c)
+        self.assertEqual(data['result']['revision'], 3)
+
+    def test_release_result_is_the_object_list_without_a_manifest(self):
+        self.release_scenario({'stdout': KUBECTL_OK})
+        result = self.body_of(self.post(self.REL))['result']
+        self.assertEqual(list(result), ['name', 'namespace', 'revision', 'status', 'chart', 'chartVersion',
+                                        'objects', 'hidden', 'history', 'appVersion', 'lastDeployed'])
+        self.assertNotIn('manifest', result)
+        self.assertEqual([o['kind'] for o in result['objects']], ['Secret', 'ConfigMap'])
+        self.assertEqual(result['objects'][0]['data'], {'password': '<hidden>', 'user': '<hidden>'})
+        self.assertEqual(result['hidden'], [])
+
+    def test_release_secret_value_is_never_in_the_response(self):
+        nested = {'apiVersion': 'v1', 'kind': 'List', 'items': [SECRET_OBJ, {'apiVersion': 'v1', 'kind': 'List',
+                                                                              'items': [SECRET_OBJ]}]}
+        self.release_scenario({'stdout': kubectl_out(SECRET_OBJ, CONFIGMAP_OBJ) + json.dumps(nested)})
+        resp = self.post(self.REL)
+        self.assertEqual(resp.code, 200)
+        for leaked in ('aHVudGVyMg', 'YWRtaW4', 'plain-text-token', 'c3VwZXI', 'last-applied', 'hunter2'):
+            self.assertNotIn(leaked, resp.body.decode())
+
+    def test_release_with_a_v1_list_answer(self):
+        self.release_scenario({'stdout': json.dumps({'apiVersion': 'v1', 'kind': 'List',
+                                                     'items': [SECRET_OBJ, CONFIGMAP_OBJ]})})
+        result = self.body_of(self.post(self.REL))['result']
+        self.assertEqual([o['kind'] for o in result['objects']], ['Secret', 'ConfigMap'])
+
+    def test_release_with_a_nested_v1_list_answer(self):
+        inner = {'apiVersion': 'v1', 'kind': 'List', 'items': [SECRET_OBJ]}
+        self.release_scenario({'stdout': json.dumps({'apiVersion': 'v1', 'kind': 'List',
+                                                     'items': [inner, CONFIGMAP_OBJ, inner]})})
+        result = self.body_of(self.post(self.REL))['result']
+        self.assertEqual([o['kind'] for o in result['objects']], ['Secret', 'ConfigMap', 'Secret'])
+        self.assertNotIn('aHVudGVyMg', json.dumps(result))
+
+    def test_release_nonzero_exit_with_partial_output_reports_hidden_parts(self):
+        err = ('error: resource mapping not found for name: "c" namespace: "" from "STDIN": no matches for kind '
+               '"Foo" in version "x/v1"\nensure CRDs are installed first\n')
+        self.release_scenario({'rc': 1, 'stdout': KUBECTL_OK, 'stderr': err})
+        result = self.body_of(self.post(self.REL))['result']
+        self.assertEqual([o['kind'] for o in result['objects']], ['Secret', 'ConfigMap'])
+        self.assertEqual(result['hidden'], [
+            {'reason': 'an object of the unknown kind Foo (its CRD is not installed on the robot)'}])
+
+    def test_release_garbage_from_kubectl_is_release_unparsable(self):
+        for create in ({'stdout': 'this is not json'}, {'rc': 1, 'stderr': 'error: error parsing STDIN: boom'},
+                       {'stdout': ''}):
+            self.release_scenario(create)
+            error = self.err(self.post(self.REL), 502, 'release_unparsable')
+            self.assertNotIn('hunter2', json.dumps(error))
+
+    def test_release_oversized_kubectl_output_is_too_large(self):
+        self.release_scenario({'stdout_bytes': inspect_ops.MANIFEST_CAP + 10})
+        self.err(self.post(self.REL), 413, 'too_large')
+
+    def test_release_kubectl_failures_that_are_not_about_the_manifest(self):
+        self.release_scenario({'rc': 1, 'stderr': 'sudo: a password is required'})
+        self.err(self.post(self.REL), 502, 'device_error')
+        self.release_scenario({'rc': 255, 'stderr': 'access denied: device_offline (x)'})
+        self.err(self.post(self.REL), 503, 'offline')
+        self.release_scenario({'rc': 1, 'stderr': 'unable to recognize "STDIN": dial tcp: connection refused'})
+        self.err(self.post(self.REL), 502, 'device_error')
+
+    def test_release_with_an_empty_manifest_asks_kubectl_nothing(self):
+        for manifest in ('', '  \n\t\n'):
+            self.release_scenario({'stdout': 'unused'}, manifest)
+            result = self.body_of(self.post(self.REL))['result']
+            self.assertEqual((result['objects'], result['hidden']), ([], []))
+        self.assertEqual(self.create_calls(), [])
+        # comments only: kubectl says so itself
+        self.release_scenario({'rc': 1, 'stderr': 'error: no objects passed to create\n'}, '# Source: x\n')
+        result = self.body_of(self.post(self.REL))['result']
+        self.assertEqual(result['objects'], [])
+        self.assertEqual(len(self.create_calls()), 1)
+
+    def test_release_stdin_is_closed_after_the_manifest(self):
+        # a kubectl that reads to EOF returns: nothing hangs on an open stdin (large manifest)
+        big = 'a: ' + 'x' * (inspect_ops.MANIFEST_CAP - 100) + '\n'
+        self.release_scenario({'stdout': KUBECTL_OK}, big)
+        self.assertEqual(self.post(self.REL).code, 200)
+        self.assertEqual(len(base64.b64decode(self.create_calls()[0]['stdin_b64'])), len(big))
 
     def test_release_for_another_record_is_a_device_error(self):
         # the Secret that comes back names another release than the one asked for
@@ -1461,6 +1344,7 @@ class TestEndpoint(InspectHTTPBase):
         self.scenario({'ops': [
             {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
             {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+            {'match': CREATE, 'stdout': KUBECTL_OK},
         ]})
         runner = self.app.settings['inspect_runner']
         body = {'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}
@@ -1476,20 +1360,22 @@ class TestEndpoint(InspectHTTPBase):
         self.scenario({'ops': [
             {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
             {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+            {'match': CREATE, 'stdout': KUBECTL_OK},
         ]})
         runner = self.app.settings['inspect_runner']
         body = {'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}
-        orig = inspect_ops.shape_release
-        try:
-            for exc in (RuntimeError('x'), RecursionError('deep'), MemoryError()):
-                def boom(*a, **k):
-                    raise exc
-                inspect_ops.shape_release = boom
-                for _ in range(3):
-                    self.assertEqual(self.post(body).code, 500)
-                    self.assertEqual(runner._jobs, 0, repr(exc))
-        finally:
-            inspect_ops.shape_release = orig
+        for name in ('decode_checked', 'shape_release_objects'):
+            orig = getattr(inspect_ops, name)
+            try:
+                for exc in (RuntimeError('x'), RecursionError('deep'), MemoryError()):
+                    def boom(*a, **k):
+                        raise exc
+                    setattr(inspect_ops, name, boom)
+                    for _ in range(3):
+                        self.assertEqual(self.post(body).code, 500)
+                        self.assertEqual(runner._jobs, 0, repr(exc))
+            finally:
+                setattr(inspect_ops, name, orig)
         self.assertEqual(self.body_of(self.post(body))['result']['revision'], 3)
         self.assertEqual(runner._jobs, 0)
 

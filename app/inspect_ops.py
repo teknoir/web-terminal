@@ -14,8 +14,9 @@ Rules, in short (the full wire contract is plans/nextgen/inspect.md section 3):
 * The user is the email the backend vouches for (``X-Inspect-User``); the hub
   applies its organisation-unit and pods/exec gate to the ssh session as for a
   terminal.
-* Output is capped and pruned; a helm release manifest is re-serialized from a strict parse
-  (Secret values hidden) before anything is returned. Content is never logged.
+* Output is capped and pruned. A helm release manifest is never parsed here: it goes to the
+  device on stdin of `kubectl create --dry-run=client -o json -f -` (Kubernetes' own decoder) and
+  only the JSON objects that come back are returned, Secret values hidden. Content is never logged.
 
 The module is deliberately not called ``inspect.py``: app/ is on sys.path first
 and would shadow the standard library module of that name.
@@ -27,7 +28,6 @@ import collections
 import concurrent.futures
 import hashlib
 import heapq
-import io
 import json
 import logging
 import os
@@ -42,7 +42,6 @@ import zlib
 
 import tornado.ioloop
 import tornado.web
-import yaml
 
 import wg_mode
 
@@ -84,11 +83,19 @@ RELEASE_JSON_CAP = 8 * 1024 * 1024
 # The backend refuses a manifest over 2 MiB (RELEASE_MAX_MANIFEST_BYTES), so the pod stops there too.
 MANIFEST_CAP = 2 * 1024 * 1024
 RELEASE_JSON_CONTAINERS = 400000      # objects plus arrays in the decoded release JSON
-# Every manifest document is built into an object (to be written again), up to this size; a bigger
-# one is replaced by a placeholder. Measured: a 1 MiB document of tiny items takes up to 160 MiB
-# and 3 s, and the container has 256Mi for two jobs at once, so the cap is 256 KiB (at most ~40 MiB).
-DOC_CAP = 256 * 1024
-# Wall-time budget of one manifest redaction (the thread stops itself at the budget).
+# Objects (after flattening Lists) and printed JSON values kubectl may return for one release; its
+# JSON text is bounded by MANIFEST_CAP and the count of `{` and `[` in it before json parses it.
+RELEASE_MAX_OBJECTS = 2000
+RELEASE_OBJECTS_CONTAINERS = 200000
+MAX_LIST_DEPTH = 8
+# An object nested deeper than this is hidden (Kubernetes objects are shallow; the response is
+# serialized again, here and in the backend, and those recurse).
+MAX_OBJECT_DEPTH = 64
+# JSON text nested deeper than this is refused before json parses it: the C scanner recurses and
+# the worker thread's stack is small (128 KiB on musl); a bigger depth segfaults the whole pod.
+JSON_MAX_DEPTH = 200
+MAX_HIDDEN = 5
+# Wall-time budget of one release shaping job (the thread stops itself at the budget).
 REDACT_BUDGET = 8.0
 # Release shaping jobs that may exist at once (one running plus one waiting).
 MAX_RELEASE_JOBS = 2
@@ -137,6 +144,7 @@ MAX_TAIL = 2000
 STATUS = {
     'invalid': 400, 'no_user': 401, 'forbidden': 403, 'not_found': 404, 'no_previous': 404,
     'not_started': 409, 'too_large': 413, 'busy': 429, 'session_limit': 429, 'device_error': 502,
+    'release_unparsable': 502,
     'offline': 503, 'unavailable': 503, 'timeout': 504, 'internal': 500,
 }
 
@@ -258,6 +266,15 @@ def kubectl_argv(req, revision=None):
                           'sh.helm.release.v1.%s.v%d' % (f['release'], revision),
                           '-o', 'jsonpath={.data.release}']
     raise ValueError(req.op)
+
+
+def kubectl_manifest_argv(req):
+    """The release manifest goes to this command on STDIN (never as an argument): kubectl decodes it
+    with Kubernetes' own decoder and prints the objects as JSON; nothing is sent to the API server
+    but the discovery calls that map each kind. `-n` only supplies the namespace of objects that name
+    none (as helm does), so the output shows where each object lands."""
+    return KUBECTL + ['-n', req.fields['namespace'], 'create', '--dry-run=client', '--validate=false',
+                      '-o', 'json', '-f', '-']
 
 
 def remote_command(argv):
@@ -480,6 +497,24 @@ def pick_revision(rows, wanted):
     return rows[0][0] if rows else None
 
 
+_JSON_STRING = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
+_JSON_BRACKETS = re.compile(rb'[{}\[\]]')
+
+
+def json_too_deep(raw, limit=JSON_MAX_DEPTH):
+    """True when the JSON text nests `{`/`[` deeper than `limit`. Strings are blanked first (in C), then
+    only the brackets are walked, so this is cheap and never recurses. Run before json.loads."""
+    depth = 0
+    for bracket in _JSON_BRACKETS.findall(_JSON_STRING.sub(b'""', raw)):
+        if bracket in (b'{', b'['):
+            depth += 1
+            if depth > limit:
+                return True
+        else:
+            depth -= 1
+    return False
+
+
 def decode_release(secret_b64):
     """Secret `data.release` (k8s base64) -> the pruned release dict. Raises Failure."""
     try:
@@ -498,6 +533,8 @@ def decode_release(secret_b64):
     # json.loads needs ~65 bytes per object or array: bound the count (an upper bound, braces inside
     # strings count too) before building them, or 8 MiB of `{}` would take ~250 MiB.
     if blob.count(b'{') + blob.count(b'[') > RELEASE_JSON_CONTAINERS:
+        raise Failure('too_large', 'The release record is too complex to read.')
+    if json_too_deep(blob):
         raise Failure('too_large', 'The release record is too complex to read.')
     try:
         rel = json.loads(blob)
@@ -520,46 +557,33 @@ def decode_release(secret_b64):
     return kept
 
 
-# libyaml's parser, never the pure-Python one: the scanner differences between the two (and
-# go-yaml, which Kubernetes uses) are exactly what a redactor must not depend on. Without libyaml
-# the inspect listener does not start (start_inspect_listener) and every document is hidden.
-_YAML_LOADER = getattr(yaml, 'CSafeLoader', None)
+# ------------------------------------------------- release manifest -> Kubernetes objects
+#
+# The manifest of a helm release is never parsed here. Reading YAML ourselves loses to parser
+# differentials with Kubernetes (line breaks, BOM, document separators ...), so the text goes to
+# the robot on stdin and `kubectl create --dry-run=client -o json` decodes it with Kubernetes' own
+# decoder. What comes back is JSON, exactly the objects Kubernetes would apply; only that JSON is
+# redacted (Secrets) and returned.
 
-# A candidate separator: a line that starts with `---` (Kubernetes' YAMLReader splits on it, see
-# _iter_documents). Lines end at \n only, like Go's line reader; `$` in MULTILINE mode is the same.
-_DOC_SPLIT = re.compile(r'^---([^\n]*)$', re.M)
-# Go's strings.TrimSpace set (unicode.IsSpace), not Python's str.strip() set (which also trims
-# \x1c-\x1f and differs on others).
-_GO_SPACE = '\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008' \
-            '\u2009\u200a\u2028\u2029\u202f\u205f\u3000'
-# A line that starts a YAML document marker (`---`, `...`) inside a chunk: it can only be a marker
-# or a trick, never part of a rendered manifest.
-_MARKER_LINE = re.compile(r'^(?:---|\.\.\.)', re.M)
 _LAST_APPLIED = 'last-applied-configuration'
-# Kubernetes and go-yaml treat \r, U+0085, U+2028 and U+2029 as line breaks, skip a BOM at the start
-# of any line, and ignore characters a YAML reader here may handle differently. A document that has
-# any of them (or any other control character but tab and newline, or something that is not valid
-# UTF-8, which in a decoded string is a lone surrogate) is hidden whole: helm never renders them.
-_UNUSUAL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f  ﻿￾￿\ud800-\udfff]')
-COMMENTS_NOTE = '# comments are not shown'
-MAX_YAML_DEPTH = 64     # nesting beyond this is never shown (the dump below recurses in Python)
-_RESOLVER = yaml.resolver.Resolver()
-_CONSTRUCTOR = yaml.constructor.SafeConstructor()
-_STR_TAG = 'tag:yaml.org,2002:str'
-
-# What the placeholder of a hidden document says.
-_R_CHARS = 'unusual characters'
-_R_BIG = 'document is too large to show'
-_R_DEEP = 'document is too deep to show'
-_R_TAGS = 'document uses YAML aliases, anchors, merge keys or tags'
-_R_DIRECTIVE = 'document uses YAML directives'
-_R_LIST = 'document is a list'
-_R_ODD = 'document is not a plain Kubernetes object'
-_R_PARSE = 'document could not be parsed'
-
-
-class _Hidden(Exception):
-    """The document must be replaced whole by a placeholder; `args[0]` is the reason."""
+_API_DOWN_RE = re.compile(r'connection refused|i/o timeout|deadline exceeded|Client\.Timeout|'
+                          r'TLS handshake timeout|no route to host|server is currently unable', re.I)
+_ERROR_LINE_RE = re.compile(r'^(?:error:|Error from server|Error:|unable to recognize)')
+_NO_KIND_RE = re.compile(r'no matches for kind "([A-Za-z][A-Za-z0-9.]{0,62})"')
+# Fixed sentences only: kubectl's own text can quote document content (go-yaml puts the offending
+# value in `cannot unmarshal !!str ...`), so the reason is chosen by pattern, never copied.
+_REASONS = (
+    (re.compile(r'resource mapping not found|no matches for kind'), None),
+    (re.compile(r'error parsing'), 'a document is not valid YAML'),
+    (re.compile(r'unable to recognize'), 'the robot could not look up the kind of a document'),
+    (re.compile(r'is missing in|is missing\b|without (?:a )?kind'), 'a document has no apiVersion or kind'),
+)
+_R_GENERIC = 'kubectl could not process a document'
+_R_ODD = 'kubectl printed something that is not a Kubernetes object'
+_R_NO_KIND = 'an object without a kind'
+_R_DEEP = 'a list nested too deep'
+_R_NESTED = 'an object nested too deep'
+_R_CUT = 'the rest of the kubectl output could not be read'
 
 
 def _check_budget(deadline):
@@ -567,118 +591,87 @@ def _check_budget(deadline):
         raise Failure('too_large', 'This is too complex to read within the time limit.')
 
 
-def _scalar(ev):
-    """The Python value of a scalar event: quoted scalars are strings, plain ones are resolved like
-    yaml.safe_load does (a tag never reaches here: tags hide the document)."""
-    tag = _RESOLVER.resolve(yaml.ScalarNode, ev.value, ev.implicit)
-    if tag == _STR_TAG:
-        return ev.value
-    return _CONSTRUCTOR.yaml_constructors[tag](_CONSTRUCTOR, yaml.ScalarNode(tag, ev.value))
-
-
-def _is_plain_string(ev):
-    return _RESOLVER.resolve(yaml.ScalarNode, ev.value, ev.implicit) == _STR_TAG
-
-
-def _parse_document(body, deadline):
-    """Build the one YAML document in `body` out of libyaml's events, with nothing composed and no
-    recursion, and refuse (raise _Hidden) everything that two parsers could read differently or that
-    could carry a value around a redaction. Returns the plain dict, or None for a text that holds no
-    document at all (nothing but comments and blank lines).
-
-    Refused: a second document, a directive or an explicit `---`, any alias, anchor or tag (the standard
-    tags too), a merge key `<<` (quoted or not), a key given twice, a key that is not a plain string or
-    is a collection, a list directly in a list, nesting deeper than MAX_YAML_DEPTH, a root that is not
-    a mapping, a top-level key with a non-ASCII character (Go folds some of them to ASCII), a top-level
-    `items` or `kind` key in any other letter case, a key that starts with `---` or `...`, a `kind` that
-    is missing, not a plain string or ends in `list` (any letter case)."""
-    stack = []             # open collections: [container, pending key or None]
-    documents = 0
-    root = None
-    count = 0
-    for ev in yaml.parse(body, Loader=_YAML_LOADER):
-        count += 1
-        if not count & 0x3FF:
-            _check_budget(deadline)
-        if isinstance(ev, yaml.DocumentStartEvent):
-            documents += 1
-            if documents > 1:
-                raise _Hidden(_R_ODD)
-            if ev.explicit or ev.version is not None or ev.tags:
-                raise _Hidden(_R_DIRECTIVE)
+def kubectl_reasons(stderr, rc):
+    """Why kubectl did not print every object: fixed sentences chosen from its error lines (no values
+    are ever copied), at most MAX_HIDDEN, in order of appearance."""
+    text = stderr.decode('utf-8', 'replace') if isinstance(stderr, bytes) else stderr
+    reasons = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not _ERROR_LINE_RE.match(line):
             continue
-        if isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
-            stack.pop()
-            continue
-        if not isinstance(ev, (yaml.ScalarEvent, yaml.AliasEvent, yaml.MappingStartEvent,
-                               yaml.SequenceStartEvent)):
-            continue                                   # stream and document end markers
-        if isinstance(ev, yaml.AliasEvent) or ev.anchor is not None or ev.tag is not None:
-            raise _Hidden(_R_TAGS)
-        scalar = isinstance(ev, yaml.ScalarEvent)
-        mapping = isinstance(ev, yaml.MappingStartEvent)
-        top = stack[-1] if stack else None
-        as_key = top is not None and isinstance(top[0], dict) and top[1] is None
-        if not stack and not mapping:
-            raise _Hidden(_R_ODD)                      # the root is not a mapping
-        if as_key:
-            if scalar and ev.value == '<<':
-                raise _Hidden(_R_TAGS)                 # a merge key, plain or quoted
-            if not scalar or not _is_plain_string(ev):
-                raise _Hidden(_R_ODD)                  # a complex key or one that is not a string
-            key = ev.value
-            if key.startswith(('---', '...')):
-                raise _Hidden(_R_ODD)                  # a look-alike of a document marker
-            if key in top[0]:
-                raise _Hidden(_R_ODD)
-            if len(stack) == 1:
-                if not key.isascii():
-                    raise _Hidden(_R_ODD)
-                lowered = key.lower()
-                if lowered == 'items':
-                    raise _Hidden(_R_LIST)
-                if lowered == 'kind' and key != 'kind':
-                    raise _Hidden(_R_ODD)
-            top[1] = key
-            continue
-        if scalar:
-            value = _scalar(ev)
-        else:
-            if not mapping and top is not None and isinstance(top[0], list):
-                raise _Hidden(_R_LIST)                 # a list directly in a list
-            if len(stack) >= MAX_YAML_DEPTH:
-                raise _Hidden(_R_DEEP)
-            value = {} if mapping else []
-        if top is None:
-            root = value
-        elif isinstance(top[0], list):
-            top[0].append(value)
-        else:
-            if len(stack) == 1 and top[1] == 'kind' and not (scalar and _is_plain_string(ev)):
-                raise _Hidden(_R_ODD)                  # the kind is a plain string
-            top[0][top[1]] = value
-            top[1] = None
-        if not scalar:
-            stack.append([value, None])
-    if documents == 0:
-        return None
-    kind = root.get('kind')
-    if not isinstance(kind, str):
-        raise _Hidden(_R_ODD)
-    if kind.strip().lower().endswith('list'):
-        raise _Hidden(_R_LIST)
-    return root
+        reason = _R_GENERIC
+        for pattern, sentence in _REASONS:
+            if pattern.search(line):
+                kind = _NO_KIND_RE.search(line)
+                reason = sentence or ('an object of the unknown kind %s (its CRD is not installed on the robot)'
+                                      % kind.group(1) if kind else
+                                      'an object of an unknown kind (its CRD is not installed on the robot)')
+                break
+        if reason not in reasons:
+            reasons.append(reason)
+    if rc != 0 and not reasons:
+        reasons.append('kubectl stopped before the end of the manifest (exit %s)' % rc)
+    return reasons[:MAX_HIDDEN]
+
+
+def parse_object_stream(raw, deadline=None):
+    """The JSON values kubectl printed, in order: one object, a v1 List, or several objects one after
+    the other (what `kubectl create -o json` prints for a multi-document input). Returns
+    (values, complete); `complete` is False when something after the last value is not JSON."""
+    if raw.count(b'{') + raw.count(b'[') > RELEASE_OBJECTS_CONTAINERS:
+        raise Failure('too_large', 'The release is too complex to read.')
+    if json_too_deep(raw):
+        raise Failure('too_large', 'The release is too complex to read.')
+    text = raw.decode('utf-8', 'replace')
+    decoder = json.JSONDecoder()
+    values, pos, size = [], 0, len(text)
+    while True:
+        _check_budget(deadline)
+        while pos < size and text[pos] in ' \t\r\n':
+            pos += 1
+        if pos >= size:
+            return values, True
+        try:
+            value, pos = decoder.raw_decode(text, pos)
+        except (RecursionError, MemoryError):
+            raise Failure('too_large', 'The release is too complex to read.')
+        except ValueError:
+            return values, False
+        values.append(value)
+        if len(values) > RELEASE_MAX_OBJECTS:
+            raise Failure('too_large', 'The release has too many objects to read.')
+
+
+def _flatten(value, out, hidden, depth, deadline):
+    """Objects of a printed value: a List (kubectl's own flattening is by an `items` array, and a v1
+    List is one) is replaced by its members; anything that is not an object is hidden."""
+    _check_budget(deadline)
+    if not isinstance(value, dict):
+        hidden.append(_R_ODD)
+        return
+    items = value.get('items')
+    if isinstance(items, list) or (value.get('apiVersion') == 'v1' and value.get('kind') == 'List'):
+        if depth >= MAX_LIST_DEPTH:
+            hidden.append(_R_DEEP)
+            return
+        for member in items if isinstance(items, list) else ():
+            _flatten(member, out, hidden, depth + 1, deadline)
+        return
+    out.append(value)
+    if len(out) > RELEASE_MAX_OBJECTS:
+        raise Failure('too_large', 'The release has too many objects to read.')
 
 
 def _is_secret(obj):
     return obj['kind'].strip().lower() == 'secret'
 
 
-def _secret_view(obj):
+def secret_view(obj):
     """What may be shown of a Secret: apiVersion, kind, type and immutable as they are (when they are
     plain scalars), the metadata without managedFields and without last-applied-configuration
-    annotations, and the keys of data, stringData and binaryData with their values hidden. Every
-    other top-level field is dropped (Kubernetes ignores them in a Secret)."""
+    annotations, and the keys of data, stringData and binaryData with the value `<hidden>`. Every
+    other top-level field is dropped."""
     out = {}
     for key in ('apiVersion', 'kind', 'metadata', 'type', 'immutable', 'data', 'stringData', 'binaryData'):
         if key not in obj:
@@ -697,13 +690,13 @@ def _secret_view(obj):
 def _metadata_view(meta):
     out = {}
     for key, value in meta.items():
-        lowered = key.lower() if key.isascii() else None
-        if lowered is None or lowered == 'managedfields':
-            continue                                   # non-ASCII keys could fold to either name
+        lowered = key.lower()
+        if lowered == 'managedfields':
+            continue
         if lowered == 'annotations':
             if not isinstance(value, dict):
                 continue
-            kept = {k: v for k, v in value.items() if k.isascii() and _LAST_APPLIED not in k.lower()}
+            kept = {k: v for k, v in value.items() if _LAST_APPLIED not in k.lower()}
             if not kept and value:
                 continue                               # only last-applied-configuration was there
             value = kept
@@ -711,93 +704,90 @@ def _metadata_view(meta):
     return out
 
 
-def _iter_documents(manifest):
-    """The text between separator lines, one at a time (no list of them is built). A separator is
-    exactly what Kubernetes' YAMLReader (k8s.io/apimachinery/pkg/util/yaml, used by Helm's
-    KubeClient.Build) ends a document on: a line that starts with `---` whose rest, after Go's
-    strings.TrimSpace (Unicode white space), is empty or starts with `#` (a trailing comment is
-    discarded). A line that starts with `---` otherwise stays in its chunk and hides the document
-    (_render_document). A chunk is contiguous text, so every character of the manifest outside the
-    separators is checked by the per-document character gate."""
-    pos = 0
-    for m in _DOC_SPLIT.finditer(manifest):
-        rest = m.group(1).strip(_GO_SPACE)
-        if rest and not rest.startswith('#'):
+def _nested_deeper_than(obj, limit):
+    """True when `obj` nests dicts and lists deeper than `limit` (iterative, never recurses)."""
+    stack = [(obj, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if isinstance(value, dict):
+            children = value.values()
+        elif isinstance(value, list):
+            children = value
+        else:
             continue
-        yield manifest[pos:m.start()]
-        pos = m.end()
-    yield manifest[pos:]
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
-def _render_document(chunk, deadline):
-    """One manifest chunk -> the text to show, or None when it holds no document. The output is
-    always a re-serialization of the parsed object, never the original text."""
-    if _YAML_LOADER is None:
-        return '# <hidden: %s>' % _R_PARSE
-    try:
-        if _UNUSUAL.search(chunk):
-            raise _Hidden(_R_CHARS)
-        if len(chunk) > DOC_CAP or len(chunk.encode('utf-8')) > DOC_CAP:
-            raise _Hidden(_R_BIG)
-        if _MARKER_LINE.search(chunk):
-            raise _Hidden(_R_DIRECTIVE)                # a look-alike of a document marker
-        obj = _parse_document(chunk, deadline)
-        if obj is None:
-            return None
-        if _is_secret(obj):
-            obj = _secret_view(obj)
-        # allow_unicode stays off: anything that came in through an escape ( , \x85 ...) goes
-        # out as an escape again, so the text shown never holds a character the gate refuses.
-        return yaml.safe_dump(obj, sort_keys=False, default_flow_style=False).rstrip('\n')
-    except Failure:
-        raise
-    except _Hidden as hidden:
-        return '# <hidden: %s>' % hidden.args[0]
-    except Exception:
-        return '# <hidden: %s>' % _R_PARSE
-
-
-def redact_manifest(manifest, deadline=None):
-    """The manifest as shown to people: every document re-serialized from the parsed object
-    (comments are dropped), Secrets reduced to their keys, whatever is odd hidden whole."""
-    out = io.StringIO()
-    written = 0
-    for chunk in _iter_documents(manifest):
+def redact_objects(values, deadline=None):
+    """kubectl's JSON values -> (objects, hidden reasons): Lists flattened, Secrets reduced."""
+    flat, hidden = [], []
+    for value in values:
+        _flatten(value, flat, hidden, 0, deadline)
+    objects = []
+    for obj in flat:
         _check_budget(deadline)
-        if not chunk.strip():
-            continue
-        shown = _render_document(chunk, deadline)
-        if shown is None:
-            continue
-        if not written:
-            out.write(COMMENTS_NOTE + '\n')
-        doc = '---\n%s\n' % shown
-        written += len(doc)
-        if written > MANIFEST_CAP:                     # characters never outnumber bytes
-            raise Failure('too_large', 'The rendered manifest is too large to read.')
-        out.write(doc)
-    text = out.getvalue()
-    if len(text.encode('utf-8')) > MANIFEST_CAP:
-        raise Failure('too_large', 'The rendered manifest is too large to read.')
-    return text
+        if not isinstance(obj.get('kind'), str):
+            hidden.append(_R_NO_KIND)
+        elif _nested_deeper_than(obj, MAX_OBJECT_DEPTH):
+            hidden.append(_R_NESTED)
+        elif _is_secret(obj):
+            objects.append(secret_view(obj))
+        else:
+            objects.append(obj)
+    return objects, hidden
 
 
-def shape_release(secret_b64, rows, name, namespace, revision, budget=REDACT_BUDGET):
-    """Decode, check it is the release asked for, drop everything but the allowed fields,
-    redact. Runs in a thread; `budget` is the wall time it may take."""
+def decode_checked(secret_b64, name, namespace, revision, budget=REDACT_BUDGET):
+    """Decode, check it is the release asked for, drop everything but the allowed fields. Returns
+    (kept, manifest bytes). Runs in a thread; `budget` is the wall time it may take."""
     deadline = time.monotonic() + budget
     kept = decode_release(secret_b64)
     if (kept['name'], kept['namespace']) != (name, namespace) or not _is_int(kept['version']) \
             or kept['version'] != revision:
         raise Failure('device_error', 'The release record on the robot does not match the request.')
-    if len(kept['manifest'].encode('utf-8')) > MANIFEST_CAP:     # before any splitting or parsing
+    try:
+        manifest = kept['manifest'].encode('utf-8')
+    except UnicodeEncodeError:
+        raise Failure('device_error', 'The release record on the robot could not be decoded.')
+    if len(manifest) > MANIFEST_CAP:
         raise Failure('too_large', 'The rendered manifest is too large to read.')
-    manifest = redact_manifest(kept['manifest'], deadline)
+    _check_budget(deadline)
+    return kept, manifest
+
+
+def shape_release_objects(kept, rows, name, namespace, revision, rc, out, err, budget=REDACT_BUDGET):
+    """kubectl's answer for the manifest (exit code, stdout, stderr) -> the release result. Runs in a
+    thread; nothing the robot printed is parsed on the event loop."""
+    deadline = time.monotonic() + budget
+    values, complete = parse_object_stream(out, deadline)
+    objects, hidden = redact_objects(values, deadline)
+    if not values:
+        text = err.decode('utf-8', 'replace')
+        if rc != 0 and 'no objects passed to create' in text:
+            pass                                       # a manifest of comments only: nothing to show
+        elif rc != 0 and _API_DOWN_RE.search(text):
+            raise Failure('device_error', 'The Kubernetes API on the robot did not answer.')
+        else:
+            reasons = kubectl_reasons(err, rc) if rc != 0 else []
+            raise Failure('release_unparsable', 'The release manifest could not be decoded on the robot'
+                          + (' (%s).' % '; '.join(reasons) if reasons else '.'))
+    else:
+        if rc != 0:
+            hidden.extend(kubectl_reasons(err, rc))
+        elif not complete:
+            hidden.append(_R_CUT)
+    unique = []
+    for reason in hidden:
+        if reason not in unique:
+            unique.append(reason)
     history = [{'revision': v, 'status': s} for v, s in rows[:HISTORY_KEEP]]
     result = {
         'name': name, 'namespace': namespace, 'revision': revision,
         'status': kept['status'], 'chart': kept['chart'], 'chartVersion': kept['chartVersion'],
-        'manifest': manifest, 'history': history,
+        'objects': objects, 'hidden': [{'reason': r} for r in unique[:MAX_HIDDEN]], 'history': history,
     }
     if kept['appVersion']:
         result['appVersion'] = kept['appVersion']
@@ -938,12 +928,13 @@ class InspectRunner:
 
     # -- processes
 
-    async def _run(self, argv, max_out, timeout, stderr_path=None, discard_stdout=False):
-        """Run argv in its own process group. Returns (rc, stdout, stderr, over)."""
+    async def _run(self, argv, max_out, timeout, stderr_path=None, discard_stdout=False, stdin_data=None):
+        """Run argv in its own process group. Returns (rc, stdout, stderr, over). `stdin_data`
+        (bytes) is written to the process's stdin, then stdin is closed."""
         err_file = open(stderr_path, 'wb') if stderr_path else None
         try:
             proc = await asyncio.create_subprocess_exec(
-                *argv, stdin=asyncio.subprocess.DEVNULL,
+                *argv, stdin=asyncio.subprocess.DEVNULL if stdin_data is None else asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL if discard_stdout else asyncio.subprocess.PIPE,
                 stderr=err_file if err_file else asyncio.subprocess.PIPE,
                 start_new_session=True)
@@ -961,9 +952,22 @@ class InspectRunner:
                     with open(stderr_path, 'rb') as fh:
                         err = fh.read(STDERR_CAP)
                     return rc
-                (out, over), (err, _) = await asyncio.gather(
+                async def feed():
+                    if stdin_data is None:
+                        return
+                    try:
+                        proc.stdin.write(stdin_data)
+                        await proc.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass                   # the process ended early; its exit code tells why
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+                (out, over), (err, _), _ = await asyncio.gather(
                     _read_capped(proc.stdout, max_out, on_over=lambda: _killpg(proc)),
-                    _read_capped(proc.stderr, STDERR_CAP))
+                    _read_capped(proc.stderr, STDERR_CAP), feed())
                 return await proc.wait()
             rc = await asyncio.wait_for(work(), timeout)
         except BaseException:
@@ -999,10 +1003,11 @@ class InspectRunner:
             if rc != 0:
                 raise classify_failure(err, rc, connection=True)
 
-    async def _remote(self, st, argv, max_out):
+    async def _remote(self, st, argv, max_out, stdin_data=None):
         full = self._base_args(st) + ['-o', 'ControlMaster=no', self.config.destination, '--',
                                       remote_command(argv)]
-        rc, out, err, over = await self._run(full, max_out=max_out, timeout=self.op_timeout)
+        rc, out, err, over = await self._run(full, max_out=max_out, timeout=self.op_timeout,
+                                             stdin_data=stdin_data)
         return rc, out, err, over
 
     async def _kubectl(self, st, argv, max_out, allow_over=False):
@@ -1055,7 +1060,6 @@ class InspectRunner:
         return Slots()
 
     async def _dispatch(self, st, req):
-        loop = asyncio.get_running_loop()
         if req.op == 'pod':
             out, _, _ = await self._kubectl(st, kubectl_argv(req), POD_CAP)
             pod = await self._light_job(shape_pod_json, out)
@@ -1077,17 +1081,24 @@ class InspectRunner:
             raise Failure('not_found', 'Revision %d of release %s does not exist.'
                           % (req.fields['revision'], req.fields['release']))
         secret, _, _ = await self._kubectl(st, kubectl_argv(req, revision), RELEASE_SECRET_CAP)
-        result = await self._shape_release(loop, secret.decode('ascii', 'replace'), rows,
-                                           req.fields['release'], req.namespace, revision)
-        return result, len(secret)
-
-    async def _shape_release(self, loop, secret, rows, name, namespace, revision):
-        """shape_release on the worker thread. The thread stops itself at its time budget, and the
-        jobs are bounded: a job that outlives its op (timeout) still counts until it ends."""
-        budget = self.redact_budget
-        return await self._run_job(
+        name, namespace, budget = req.fields['release'], req.namespace, self.redact_budget
+        text = secret.decode('ascii', 'replace')
+        kept, manifest = await self._run_job(
             self.pool, '_jobs', MAX_RELEASE_JOBS,
-            lambda: shape_release(secret, rows, name, namespace, revision, budget=budget))
+            lambda: decode_checked(text, name, namespace, revision, budget=budget))
+        if manifest.strip():
+            rc, out, err, over = await self._remote(st, kubectl_manifest_argv(req), MANIFEST_CAP,
+                                                    stdin_data=manifest)
+            if over:
+                raise Failure('too_large', 'The rendered manifest is too large to read.')
+            if rc == 255 or b'sudo: a password is required' in err:
+                raise classify_failure(err, rc)
+        else:
+            rc, out, err = 1, b'', b'error: no objects passed to create'
+        result = await self._run_job(
+            self.pool, '_jobs', MAX_RELEASE_JOBS,
+            lambda: shape_release_objects(kept, rows, name, namespace, revision, rc, out, err, budget=budget))
+        return result, len(secret)
 
     async def _light_job(self, fn, raw):
         """Parse and shape pod or events JSON on the light worker thread, with the same kind of
@@ -1326,11 +1337,6 @@ def make_inspect_app(config, principals, runner=None, **runner_kwargs):
 def start_inspect_listener(config, principals, port, **runner_kwargs):
     """Start the 8091 listener and the sweeper; returns (application, sweeper) or None when disabled."""
     if not principals:
-        return None
-    if _YAML_LOADER is None:
-        # Release manifests are redacted by parsing them: only with libyaml's parser, never the
-        # pure-Python one, so without it nothing is served.
-        logger.error("Inspect API not started: PyYAML was built without libyaml (CSafeLoader)")
         return None
     app = make_inspect_app(config, principals, **runner_kwargs)
     app.listen(port, address='0.0.0.0', max_body_size=LISTEN_MAX_BODY)
