@@ -607,6 +607,63 @@ class TestRelease(unittest.TestCase):
         self.assertEqual(self.hidden_reason(text), [])
         self.assertEqual(shown[2]['data']['config.json'], '{"a": 1,\n "b": [1, 2]}\n')
 
+    # --- document splitting like Kubernetes' YAMLReader (plans/nextgen/inspect.md 3.4) ---
+
+    SECRET_IN_KEY = 'kind: ConfigMap\nmetadata: {name: x}\n%s\nkind: Secret\ndata: {a: LEAK1}\n'
+
+    def test_separator_with_a_glued_comment_splits_like_kubernetes(self):
+        # `---#x: |` ends the ConfigMap for Kubernetes, which then reads a Secret out of the rest;
+        # here the rest is its own document and shown as a Secret (keys only), never as text
+        import yaml
+        for sep in ('---#x: |', '---\u00a0#x: |', '---\t#x: |', '---\u0085#x: |', '---\u3000#x: |', '--- #x: |'):
+            text = inspect_ops.redact_manifest('---\n' + self.SECRET_IN_KEY % sep)
+            self.assertNotIn('LEAK1', text, sep)
+            self.assertNotIn('# <hidden', text, sep)
+            self.assertEqual([d['kind'] for d in yaml.safe_load_all(text) if d], ['ConfigMap', 'Secret'], sep)
+
+    def test_the_reviewers_repro_hides_the_nested_secret(self):
+        manifest = ('---\nkind: ConfigMap\nmetadata: {name: x}\n---#x: |\n'
+                    '  apiVersion: v1\n  kind: Secret\n  data: {password: LEAK1}\n')
+        text = inspect_ops.redact_manifest(manifest)
+        self.assertNotIn('LEAK1', text)
+        self.assertIn('password: <hidden>', text)       # the Secret half is read as a Secret
+        self.assertEqual(self.hidden_reason(text), [])
+
+    def test_separator_line_with_a_comment_still_separates(self):
+        import yaml
+        for sep in ('--- # comment', '---# comment', '---\t# c', '---   ', '---\u00a0# c', '---\u2003', '---\r'):
+            manifest = '---\nkind: ConfigMap\ndata: {a: one}\n%s\nkind: ConfigMap\ndata: {b: two}\n' % sep
+            text = inspect_ops.redact_manifest(manifest)
+            if '\r' in sep:       # the CR of the separator is dropped with it; no other line has one
+                manifest = manifest.replace('\r', '')
+            shown = [d for d in yaml.safe_load_all(inspect_ops.redact_manifest(manifest)) if d]
+            self.assertEqual([d['data'] for d in shown], [{'a': 'one'}, {'b': 'two'}], sep)
+            self.assertEqual(self.hidden_reason(text), [], sep)
+
+    def test_a_dash_line_that_is_no_separator_hides_the_document(self):
+        for line in ('---x', '--- x', '---{a: b}', '---|', '--- !!map', '...', '... x', '...#c'):
+            text = inspect_ops.redact_manifest(
+                '---\nkind: ConfigMap\ndata: {before: shown}\n---\nkind: ConfigMap\n%s\ndata: {a: LEAK1}\n'
+                '---\nkind: ConfigMap\ndata: {after: shown}\n' % line)
+            self.assertNotIn('LEAK1', text, line)
+            self.assertEqual(len(self.hidden_reason(text)), 1, line)
+            self.assertIn('before: shown', text, line)
+            self.assertIn('after: shown', text, line)
+
+    def test_a_key_that_looks_like_a_document_marker_hides_the_document(self):
+        for key in ('---#x', '---', '----', '--- x', '...', '...x', '"---#x"', "'...'"):
+            for body in ('kind: ConfigMap\nm:\n  %s: |\n    kind: Secret\n    data: {a: LEAK1}\n' % key,
+                         'kind: ConfigMap\ndata:\n  %s: LEAK1\n' % key,
+                         'kind: ConfigMap\nl:\n- %s: LEAK1\n' % key):
+                text = self.show(body)
+                self.assertNotIn('LEAK1', text, key)
+                self.assertEqual(len(self.hidden_reason(text)), 1, (key, body))
+
+    def test_other_keys_with_dashes_are_still_shown(self):
+        text = self.show('kind: ConfigMap\ndata:\n  "--flag": a\n  "-x": b\n  "..": c\n  a---b: d\n')
+        self.assertEqual(self.hidden_reason(text), [])
+        self.assertIn('--flag: a', text)
+
     def test_output_is_a_reserialization_not_the_original_text(self):
         text = self.show('# lead\nkind: ConfigMap  # trailing\ndata: {a: 1, b: "x"}   # more\n')
         self.assertEqual(text, '# comments are not shown\n---\nkind: ConfigMap\ndata:\n  a: 1\n  b: x\n')
@@ -820,12 +877,13 @@ class TestRelease(unittest.TestCase):
 
     def test_more_than_one_yaml_document_in_a_chunk_is_hidden(self):
         for body in ('kind: ConfigMap\n...\nkind: Secret\ndata: {a: LEAK1}\n',
-                     'kind: ConfigMap\n--- #\nkind: Secret\ndata: {a: LEAK1}\n',
+                     'kind: ConfigMap\n--- !x\nkind: Secret\ndata: {a: LEAK1}\n',
                      'kind: ConfigMap\n...\n--- !!map\nkind: Secret\ndata: {a: LEAK1}\n'):
             text = self.show(body)
             self.assertNotIn('LEAK1', text, body)
             self.assertIn(self.hidden_reason(text), (['# <hidden: document is not a plain Kubernetes object>'],
-                                                     ['# <hidden: document could not be parsed>']), body)
+                                                     ['# <hidden: document could not be parsed>'],
+                                                     ['# <hidden: document uses YAML directives>']), body)
 
     def test_nested_lists_and_items_are_hidden(self):
         secret = '{kind: Secret, data: {password: LEAK1}, stringData: {token: LEAK2}}'

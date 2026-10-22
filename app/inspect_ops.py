@@ -525,7 +525,16 @@ def decode_release(secret_b64):
 # the inspect listener does not start (start_inspect_listener) and every document is hidden.
 _YAML_LOADER = getattr(yaml, 'CSafeLoader', None)
 
-_DOC_SPLIT = re.compile(r'^---[ \t]*$', re.M)
+# A candidate separator: a line that starts with `---` (Kubernetes' YAMLReader splits on it, see
+# _iter_documents). Lines end at \n only, like Go's line reader; `$` in MULTILINE mode is the same.
+_DOC_SPLIT = re.compile(r'^---([^\n]*)$', re.M)
+# Go's strings.TrimSpace set (unicode.IsSpace), not Python's str.strip() set (which also trims
+# \x1c-\x1f and differs on others).
+_GO_SPACE = '\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008' \
+            '\u2009\u200a\u2028\u2029\u202f\u205f\u3000'
+# A line that starts a YAML document marker (`---`, `...`) inside a chunk: it can only be a marker
+# or a trick, never part of a rendered manifest.
+_MARKER_LINE = re.compile(r'^(?:---|\.\.\.)', re.M)
 _LAST_APPLIED = 'last-applied-configuration'
 # Kubernetes and go-yaml treat \r, U+0085, U+2028 and U+2029 as line breaks, skip a BOM at the start
 # of any line, and ignore characters a YAML reader here may handle differently. A document that has
@@ -581,8 +590,8 @@ def _parse_document(body, deadline):
     tags too), a merge key `<<` (quoted or not), a key given twice, a key that is not a plain string or
     is a collection, a list directly in a list, nesting deeper than MAX_YAML_DEPTH, a root that is not
     a mapping, a top-level key with a non-ASCII character (Go folds some of them to ASCII), a top-level
-    `items` or `kind` key in any other letter case, a `kind` that is missing, not a plain string or ends
-    in `list` (any letter case)."""
+    `items` or `kind` key in any other letter case, a key that starts with `---` or `...`, a `kind` that
+    is missing, not a plain string or ends in `list` (any letter case)."""
     stack = []             # open collections: [container, pending key or None]
     documents = 0
     root = None
@@ -618,6 +627,8 @@ def _parse_document(body, deadline):
             if not scalar or not _is_plain_string(ev):
                 raise _Hidden(_R_ODD)                  # a complex key or one that is not a string
             key = ev.value
+            if key.startswith(('---', '...')):
+                raise _Hidden(_R_ODD)                  # a look-alike of a document marker
             if key in top[0]:
                 raise _Hidden(_R_ODD)
             if len(stack) == 1:
@@ -701,11 +712,18 @@ def _metadata_view(meta):
 
 
 def _iter_documents(manifest):
-    """The text between `---` separator lines, one at a time (no list of them is built). Only a
-    line of exactly `---` plus blanks separates; a chunk is contiguous text, so every character of
-    the manifest outside the separators is checked by the per-document character gate."""
+    """The text between separator lines, one at a time (no list of them is built). A separator is
+    exactly what Kubernetes' YAMLReader (k8s.io/apimachinery/pkg/util/yaml, used by Helm's
+    KubeClient.Build) ends a document on: a line that starts with `---` whose rest, after Go's
+    strings.TrimSpace (Unicode white space), is empty or starts with `#` (a trailing comment is
+    discarded). A line that starts with `---` otherwise stays in its chunk and hides the document
+    (_render_document). A chunk is contiguous text, so every character of the manifest outside the
+    separators is checked by the per-document character gate."""
     pos = 0
     for m in _DOC_SPLIT.finditer(manifest):
+        rest = m.group(1).strip(_GO_SPACE)
+        if rest and not rest.startswith('#'):
+            continue
         yield manifest[pos:m.start()]
         pos = m.end()
     yield manifest[pos:]
@@ -721,6 +739,8 @@ def _render_document(chunk, deadline):
             raise _Hidden(_R_CHARS)
         if len(chunk) > DOC_CAP or len(chunk.encode('utf-8')) > DOC_CAP:
             raise _Hidden(_R_BIG)
+        if _MARKER_LINE.search(chunk):
+            raise _Hidden(_R_DIRECTIVE)                # a look-alike of a document marker
         obj = _parse_document(chunk, deadline)
         if obj is None:
             return None
