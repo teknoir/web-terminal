@@ -84,10 +84,14 @@ RELEASE_SECRET_CAP = 3 * 1024 * 1024
 RELEASE_JSON_CAP = 8 * 1024 * 1024
 # The backend refuses a manifest over 2 MiB (RELEASE_MAX_MANIFEST_BYTES), so the pod stops there too.
 MANIFEST_CAP = 2 * 1024 * 1024
-# kubectl prints the objects pretty-printed (about 2.5 times the YAML), so its stdout may be 4 times
-# the manifest cap; the objects are then measured as compact JSON against MANIFEST_CAP, which is how
-# the backend measures them.
-KUBECTL_OUT_CAP = 4 * MANIFEST_CAP
+# kubectl prints the objects pretty-printed, so its stdout is larger than the compact JSON; the
+# objects are then measured as compact JSON against MANIFEST_CAP, which is how the backend measures
+# them. The stdout is held in memory three times over while it is shaped (bytes, decoded text,
+# parsed values; a string with one non-BMP character is stored at 4 bytes per character, so the text
+# and the values are up to 4 times the bytes each): 4 MiB keeps one shaping job near 40 MiB of the
+# container's 256Mi (tests/rss_probe.py); 8 MiB needed about 100 MiB. A release whose objects print
+# as more than 4 MiB (compact JSON of roughly 1.5 MiB or more) is `too_large`.
+KUBECTL_OUT_CAP = 2 * MANIFEST_CAP
 # json.loads builds an object per JSON value (a number, `{}`, `[]`, a key), so JSON text is bounded
 # by its byte cap and by the number of VALUES in it (json_scan: commas, colons and brackets outside
 # strings) before json parses it. Decoded release record:
@@ -295,7 +299,9 @@ def remote_command(argv):
 
 # ------------------------------------------------------------- stderr mapping
 
-_DENIED_RE = re.compile(r'access denied: ([a-z_]+)(?: \((.*?)\))?\s*$', re.M)
+# The detail is at most 300 characters on one line: an unbounded `(.*?)` is tried from every
+# `access denied: x (` in the (device-controlled) stderr and ran to the end of the line each time.
+_DENIED_RE = re.compile(r'access denied: ([a-z_]+)(?: \(([^\n]{0,300}?)\))?\s*$', re.M)
 _OFFLINE = ('device_offline', 'device_disabled', 'device_revoked', 'device_unknown', 'posture',
             'port_not_allowed')
 _SENTENCE = {
@@ -570,16 +576,21 @@ def json_too_deep(raw, limit=JSON_MAX_DEPTH):
 
 
 def _cap_str(value):
-    """Release metadata that is shown as is: a string is cut to RELEASE_META_CAP characters."""
-    return value[:RELEASE_META_CAP] if isinstance(value, str) else value
+    """Release metadata that is shown as is: a string is cut to RELEASE_META_CAP characters; anything
+    else (a list, a mapping, a number) is None, as in the backend."""
+    return value[:RELEASE_META_CAP] if isinstance(value, str) else None
 
 
 def decode_release(secret_b64):
-    """Secret `data.release` (k8s base64) -> the pruned release dict. Raises Failure."""
+    """Secret `data.release` (k8s base64) -> the pruned release dict. Raises Failure.
+
+    Memory: every copy of the record is dropped as soon as the next one exists. The worst case is a
+    record whose strings each hold one non-BMP character (4 bytes per character): the decoded text
+    and the parsed values are then 4 times the UTF-8 bytes each and are alive together while
+    json.loads runs, so nothing else (the base64 layers, the inflated bytes) may be."""
     try:
-        inner = base64.b64decode(secret_b64.strip(), validate=True)      # k8s
-        blob = base64.b64decode(inner, validate=True)                    # helm
-    except (binascii.Error, ValueError):
+        blob = base64.b64decode(base64.b64decode(secret_b64.strip(), validate=True), validate=True)
+    except (binascii.Error, ValueError):                 # k8s base64, then helm base64
         raise Failure('device_error', 'The release record on the robot could not be decoded.')
     if blob[:3] == b'\x1f\x8b\x08':
         d = zlib.decompressobj(16 + zlib.MAX_WBITS)
@@ -589,22 +600,27 @@ def decode_release(secret_b64):
             raise Failure('device_error', 'The release record on the robot could not be decoded.')
         if len(blob) > RELEASE_JSON_CAP or d.unconsumed_tail:
             raise Failure('too_large', 'The release record is too large to read.')
+        del d
     # json.loads builds an object per JSON value (~65 bytes for each container): bound the number of
     # values (not only containers: 8 MiB of `1,1,1,` is 4M of them) and the depth on the UTF-8 bytes,
-    # before anything is built. Decoded explicitly: json.loads(bytes) would sniff UTF-16/32 and read
-    # a text this scan saw as bytes of something else.
+    # before anything is built (also before the text is, which can be 4 times the bytes). Decoded
+    # explicitly: json.loads(bytes) would sniff UTF-16/32 and read a text this scan saw as bytes of
+    # something else.
+    if json_scan(blob, RELEASE_JSON_VALUES):
+        raise Failure('too_large', 'The release record is too complex to read.')
     try:
         text = blob.decode('utf-8')
     except UnicodeDecodeError:
         raise Failure('device_error', 'The release record on the robot could not be decoded.')
-    if json_scan(blob, RELEASE_JSON_VALUES):
-        raise Failure('too_large', 'The release record is too complex to read.')
+    del blob
     try:
         rel = json.loads(text)
     except (RecursionError, MemoryError):          # deeply nested or huge: not a record to read
         raise Failure('too_large', 'The release record is too complex to read.')
     except ValueError:
         raise Failure('device_error', 'The release record on the robot could not be decoded.')
+    finally:
+        del text
     if not isinstance(rel, dict):
         raise Failure('device_error', 'The release record on the robot could not be decoded.')
     info = rel.get('info') if isinstance(rel.get('info'), dict) else {}
@@ -731,8 +747,8 @@ def _is_secret(obj):
 
 
 def secret_view(obj):
-    """What may be shown of a Secret: apiVersion, kind, type and immutable as they are (when they are
-    plain scalars), the metadata without managedFields and without last-applied-configuration
+    """What may be shown of a Secret: apiVersion and kind as they are (when they are plain scalars),
+    type (only a string) and immutable (only a boolean), the metadata without managedFields and without last-applied-configuration
     annotations, and the keys of data, stringData and binaryData with the value `<hidden>`. Every
     other top-level field is dropped."""
     out = {}
@@ -745,8 +761,15 @@ def secret_view(obj):
         elif key == 'metadata':
             if isinstance(value, dict):
                 out[key] = _metadata_view(value)
-        elif not isinstance(value, (dict, list)):
-            out[key] = value
+        elif key == 'type':
+            if isinstance(value, str):
+                out[key] = value
+        elif key == 'immutable':
+            if isinstance(value, bool):
+                out[key] = value
+        else:                                          # apiVersion, kind
+            if not isinstance(value, (dict, list)):
+                out[key] = value
     return out
 
 
@@ -821,19 +844,62 @@ def decode_checked(secret_b64, name, namespace, revision, budget=REDACT_BUDGET):
     return kept, manifest
 
 
+_encode_str = json.encoder.encode_basestring        # ensure_ascii=False, C implementation
+_STR_SLICE = 1 << 16
+_LITERAL_SIZE = {True: 4, False: 5}
+
+
+def _json_str_size(text):
+    """Bytes of `text` as a JSON string (UTF-8, quotes and escapes included). A long string is
+    measured in slices so that no escaped copy of the whole string (up to 4 bytes per character in
+    memory) is built."""
+    if len(text) <= _STR_SLICE:
+        return len(_encode_str(text).encode('utf-8', 'replace'))
+    return 2 + sum(len(_encode_str(text[i:i + _STR_SLICE]).encode('utf-8', 'replace')) - 2
+                   for i in range(0, len(text), _STR_SLICE))
+
+
+def compact_json_size(value, limit):
+    """UTF-8 size of json.dumps(value, separators=(',', ':'), ensure_ascii=False), computed without
+    building that text (no copy of the whole value is made) and iteratively (no recursion). Stops
+    and returns a number above `limit` as soon as the size is known to exceed it."""
+    total, stack = 0, [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            total += _json_str_size(item)
+        elif item is None:
+            total += 4
+        elif isinstance(item, bool):
+            total += _LITERAL_SIZE[item]
+        elif isinstance(item, dict):
+            total += 2 + len(item) + max(len(item) - 1, 0)   # braces, a colon per pair, commas between
+            for key, member in item.items():
+                total += _json_str_size(key)
+                stack.append(member)
+        elif isinstance(item, list):
+            total += 2 + max(len(item) - 1, 0)      # brackets and commas between
+            stack.extend(item)
+        else:
+            total += len(json.dumps(item))          # int, float (Infinity, NaN as json.dumps)
+        if total > limit:
+            return total
+    return total
+
+
 def shape_release_objects(kept, rows, name, namespace, revision, rc, out, err, budget=REDACT_BUDGET):
     """kubectl's answer for the manifest (exit code, stdout, stderr) -> the release result. Runs in a
     thread; nothing the robot printed is parsed on the event loop."""
     deadline = time.monotonic() + budget
     values, complete = parse_object_stream(out, deadline)
     objects, hidden = redact_objects(values, deadline)
+    printed = bool(values)
+    del values                                     # the redacted objects are what is left to hold
     # kubectl's JSON is indented; what counts is the compact form (the backend measures that)
-    compact = json.dumps(objects, separators=(',', ':'), ensure_ascii=False)
-    if len(compact.encode('utf-8', 'replace')) > MANIFEST_CAP:
+    if compact_json_size(objects, MANIFEST_CAP) > MANIFEST_CAP:
         raise Failure('too_large', 'The rendered objects are too large to read.')
-    del compact
     _check_budget(deadline)
-    if not values:
+    if not printed:
         text = err.decode('utf-8', 'replace')
         if rc != 0 and 'no objects passed to create' in text:
             pass                                       # a manifest of comments only: nothing to show

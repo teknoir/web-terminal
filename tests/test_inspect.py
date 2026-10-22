@@ -351,6 +351,27 @@ class TestStderrMapping(unittest.TestCase):
         self.assertEqual(self.f('Host key verification failed.', 1, connection=True).code, 'unavailable')
         self.assertEqual(self.f('access denied: forbidden (x)', 1, connection=True).code, 'forbidden')
 
+    def test_denial_detail_keeps_parentheses_inside_it(self):
+        self.assertEqual(self.f('access denied: forbidden (outside (unit a) here)', 255).message,
+                         'outside (unit a) here')
+
+    def test_denial_pattern_is_linear_on_repeated_openers(self):
+        # an unbounded `(.*?)` was tried from every opener and ran to the end of the line each time
+        text = ('access denied: a (' * 1000)[:16 * 1024]
+        for fn in (lambda: inspect_ops._DENIED_RE.search(text),
+                   lambda: inspect_ops.manifest_failure(text, 255),
+                   lambda: inspect_ops.classify_failure(text, 255)):
+            best = min(self.timed(fn) for _ in range(3))
+            self.assertLess(best, 0.02, best)
+        spaced = ('access denied: a (' + ' ' * 40) * 400
+        self.assertLess(min(self.timed(lambda: inspect_ops._DENIED_RE.search(spaced)) for _ in range(3)), 0.02)
+
+    @staticmethod
+    def timed(fn):
+        started = time.perf_counter()
+        fn()
+        return time.perf_counter() - started
+
     def test_device_output_cannot_fake_a_hub_denial(self):
         # kubectl exit 1 printing "access denied: forbidden" is a device_error, not a hub answer
         self.assertEqual(self.f('access denied: forbidden (x)', 1).code, 'device_error')
@@ -604,6 +625,34 @@ class TestRelease(unittest.TestCase):
         self.assertEqual(obj, {'apiVersion': 'v1', 'kind': 'Secret', 'data': '<hidden>',
                                'stringData': '<hidden>', 'binaryData': '<hidden>'})
 
+    def test_a_secret_keeps_type_only_as_a_string_and_immutable_only_as_a_boolean(self):
+        for field, value, kept in (('type', 'Opaque', True), ('type', '', True), ('type', 5, False),
+                                   ('type', True, False), ('type', None, False), ('type', 1.5, False),
+                                   ('immutable', True, True), ('immutable', False, True),
+                                   ('immutable', 1, False), ('immutable', 0, False),
+                                   ('immutable', 'true', False), ('immutable', None, False),
+                                   ('immutable', 1.0, False)):
+            obj = self.objects({'apiVersion': 'v1', 'kind': 'Secret', 'metadata': {'name': 'n'},
+                                field: value})[0]
+            if kept:
+                self.assertEqual(obj[field], value, (field, value))
+                self.assertIs(type(obj[field]), type(value))
+            else:
+                self.assertNotIn(field, obj, (field, value))
+        # apiVersion and kind still pass as plain scalars only
+        obj = inspect_ops.secret_view({'apiVersion': {'LEAK': 1}, 'kind': 'Secret'})
+        self.assertEqual(obj, {'kind': 'Secret'})
+
+    def test_compact_json_size_is_exactly_what_json_dumps_gives(self):
+        samples = [{}, [], '', {'a': {}}, [[], {}], 1e999, float('nan'), -0.0, 10 ** 40, True, None,
+                   {'k': [1, 2.5, True, False, None, 'e\u00e9\u2028\n"\\\x01\x7f\U0001F600\ud800']},
+                   {'\u00e9\U0001F600': 'x' * 200000 + '\U0001F600\n'}, ['a' * 70000 + '\n' * 70000]]
+        for value in samples:
+            want = len(json.dumps(value, separators=(',', ':'), ensure_ascii=False).encode('utf-8', 'replace'))
+            self.assertEqual(inspect_ops.compact_json_size(value, 10 ** 12), want, repr(value)[:60])
+        # it stops as soon as the limit is passed
+        self.assertGreater(inspect_ops.compact_json_size({'a': ['x' * 100] * 100}, 500), 500)
+
     def test_a_secret_value_never_reaches_the_result_in_any_position(self):
         out = self.shape(kubectl_out(SECRET_OBJ, CONFIGMAP_OBJ, {'apiVersion': 'v1', 'kind': 'List', 'items': [
             SECRET_OBJ, {'apiVersion': 'v1', 'kind': 'List', 'items': [SECRET_OBJ]}]}))
@@ -765,7 +814,7 @@ class TestRelease(unittest.TestCase):
         self.assertEqual(cm.exception.code, 'too_large')
         big['data']['k'] = 'x' * (inspect_ops.MANIFEST_CAP - 1000)
         self.assertEqual(len(self.shape(json.dumps(big, indent=4))['objects']), 1)
-        self.assertEqual(inspect_ops.KUBECTL_OUT_CAP, 4 * inspect_ops.MANIFEST_CAP)
+        self.assertEqual(inspect_ops.KUBECTL_OUT_CAP, 2 * inspect_ops.MANIFEST_CAP)
 
     def test_an_object_in_another_namespace_is_present(self):
         # no `-n` on the command: kubectl keeps the namespace an object names (helm/k3s install such objects)
@@ -1099,9 +1148,26 @@ class TestRelease(unittest.TestCase):
             self.assertEqual(kept[key], 'x' * inspect_ops.RELEASE_META_CAP, key)
         self.assertEqual(inspect_ops.RELEASE_META_CAP, 256)
         self.assertEqual((kept['name'], kept['manifest']), ('nvr', 'm'))
-        rel['info'] = {'status': 7, 'last_deployed': None}                  # not strings: left alone
+        # not strings: None, as in the backend (a number, a mapping or a huge list is never passed on)
+        rel['info'] = {'status': 7, 'last_deployed': None}
         kept = inspect_ops.decode_release(self.record(json.dumps(rel).encode()))
-        self.assertEqual((kept['status'], kept['last_deployed']), (7, None))
+        self.assertEqual((kept['status'], kept['last_deployed']), (None, None))
+
+    def test_release_metadata_that_is_not_a_string_is_none(self):
+        huge = ['x' * 1000] * 2000                                          # a 2 MB list in `status`
+        rel = {'name': 'nvr', 'namespace': 'teknoir-demo', 'version': 3, 'manifest': 'm',
+               'info': {'status': huge, 'last_deployed': {'a': huge}},
+               'chart': {'metadata': {'name': 5, 'version': True, 'appVersion': [1]}}}
+        kept = inspect_ops.decode_release(self.record(json.dumps(rel).encode()))
+        for key in ('status', 'last_deployed', 'chart', 'chartVersion', 'appVersion'):
+            self.assertIsNone(kept[key], key)
+        out = inspect_ops.shape_release_objects(kept, [(3, 'deployed')], 'nvr', 'teknoir-demo', 3, 0,
+                                                kubectl_out(CONFIGMAP_OBJ).encode(), b'')
+        self.assertIsNone(out['status'])
+        self.assertIsNone(out['chart'])
+        self.assertNotIn('appVersion', out)
+        self.assertNotIn('lastDeployed', out)
+        self.assertLess(len(json.dumps(out)), 2000)
 
     def test_manifest_failure_names_nothing_from_stderr(self):
         secret = 'hunter2'
@@ -1181,6 +1247,70 @@ class TestRelease(unittest.TestCase):
         self.assertEqual(inspect_ops.pick_revision(rows, 3), 3)
         self.assertIsNone(inspect_ops.pick_revision(rows, 9))
         self.assertEqual(inspect_ops.pick_revision([(5, 'failed'), (4, 'failed')], None), 5)   # else newest
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'ru_maxrss is in KiB on Linux only')
+class TestPeakMemory(unittest.TestCase):
+    """Process peak (ru_maxrss) of the shaping jobs, one FRESH process per case (the peak of a
+    process never goes down, so cases cannot share one). Every string in every input holds one
+    non-BMP character: CPython then stores it at 4 bytes per character, and the decoded text, the
+    parsed values and the bytes are alive together. Every input passes the value and depth scan,
+    so the memory is spent before any size verdict. Peaks are MiB above the process right after
+    its imports (the input held in memory included); measured on Python 3.11 / Linux before and
+    after the change (tests/rss_probe.py):
+
+      case            before   after (limit)
+      shape_single     111.8   39.8 (56)       kubectl stdout at its cap, one big string
+      shape_long       105.3   36.2 (56)       8300 / 4100 strings of 1000 characters
+      shape_many       125.7   38.8 (56)       50000 strings of 150 characters
+      shape_objects    100.4   33.2 (56)       1500 objects
+      shape_ok          24.4   16.5 (40)       the largest accepted answer (about 2 MiB compact)
+      decode_single     79.8   72.1 (100)      8 MiB record, one big string
+      decode_long       70.7   62.3 (100)
+      decode_many       89.2   81.0 (100)      8 MiB record, 80000 small objects
+      decode_values     40.5   15.8 (24)       refused on the value count before the text is built
+      events            18.0   18.0 (40)
+
+    The cap of kubectl's stdout went from 8 MiB to 4 MiB (shape_*: the 8 MiB input needs 69-80 MiB
+    even with the new code); RELEASE_JSON_CAP stays 8 MiB (decode_*: about 40 MiB of text plus
+    values at the cap, in one job at a time)."""
+
+    LIMITS = {'shape_single': 56, 'shape_long': 56, 'shape_many': 56, 'shape_objects': 56,
+              'shape_ok': 40, 'decode_single': 100, 'decode_long': 100, 'decode_many': 100,
+              'decode_values': 24, 'events': 40}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rss_probe.py')
+        cls.app = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app')
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def probe_case(self, case):
+        import rss_probe
+        path = os.path.join(self.tmp, case + '.bin')
+        for mode in ('gen', 'run'):
+            proc = subprocess.run([sys.executable, '-I', self.probe, mode, self.app, case, path],
+                                  capture_output=True, text=True, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        result = json.loads(proc.stdout)
+        self.assertEqual(result['outcome'], rss_probe.CASES[case], case)
+        return result['peak_mib']
+
+    def test_the_cases_and_limits_agree(self):
+        import rss_probe
+        self.assertEqual(sorted(rss_probe.CASES), sorted(self.LIMITS))
+
+    def test_peak_memory_of_shaping_kubectl_output_and_release_records(self):
+        peaks = {case: self.probe_case(case) for case in sorted(self.LIMITS)}
+        for case, peak in peaks.items():
+            self.assertLess(peak, self.LIMITS[case], (case, peaks))
+
+    def test_kubectl_stdout_cap_is_4_mib(self):
+        self.assertEqual(inspect_ops.KUBECTL_OUT_CAP, 4 * 1024 * 1024)
 
 
 class TestPrincipalsAndXfcc(unittest.TestCase):
