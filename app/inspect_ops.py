@@ -14,8 +14,8 @@ Rules, in short (the full wire contract is plans/nextgen/inspect.md section 3):
 * The user is the email the backend vouches for (``X-Inspect-User``); the hub
   applies its organisation-unit and pods/exec gate to the ssh session as for a
   terminal.
-* Output is capped, pruned and (for helm releases) Secret values are redacted
-  before anything is returned. Content is never logged.
+* Output is capped and pruned; a helm release manifest is re-serialized from a strict parse
+  (Secret values hidden) before anything is returned. Content is never logged.
 
 The module is deliberately not called ``inspect.py``: app/ is on sys.path first
 and would shadow the standard library module of that name.
@@ -84,9 +84,10 @@ RELEASE_JSON_CAP = 8 * 1024 * 1024
 # The backend refuses a manifest over 2 MiB (RELEASE_MAX_MANIFEST_BYTES), so the pod stops there too.
 MANIFEST_CAP = 2 * 1024 * 1024
 RELEASE_JSON_CONTAINERS = 400000      # objects plus arrays in the decoded release JSON
-# Only Secret and *List documents are ever built into objects, and only up to this size (a bigger
-# one is replaced by a placeholder instead of being redacted); everything else is scanned as events.
-SECRET_DOC_CAP = 256 * 1024
+# Every manifest document is built into an object (to be written again), up to this size; a bigger
+# one is replaced by a placeholder. Measured: a 1 MiB document of tiny items takes up to 160 MiB
+# and 3 s, and the container has 256Mi for two jobs at once, so the cap is 256 KiB (at most ~40 MiB).
+DOC_CAP = 256 * 1024
 # Wall-time budget of one manifest redaction (the thread stops itself at the budget).
 REDACT_BUDGET = 8.0
 # Release shaping jobs that may exist at once (one running plus one waiting).
@@ -519,44 +520,37 @@ def decode_release(secret_b64):
     return kept
 
 
-_YAML_LOADER = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+# libyaml's parser, never the pure-Python one: the scanner differences between the two (and
+# go-yaml, which Kubernetes uses) are exactly what a redactor must not depend on. Without libyaml
+# the inspect listener does not start (start_inspect_listener) and every document is hidden.
+_YAML_LOADER = getattr(yaml, 'CSafeLoader', None)
 
-_DOC_SPLIT = re.compile(r'^---[ \t\r]*$', re.M)
-_LAST_APPLIED = 'kubectl.kubernetes.io/last-applied-configuration'
+_DOC_SPLIT = re.compile(r'^---[ \t]*$', re.M)
+_LAST_APPLIED = 'last-applied-configuration'
+# Kubernetes and go-yaml treat \r, U+0085, U+2028 and U+2029 as line breaks, skip a BOM at the start
+# of any line, and ignore characters a YAML reader here may handle differently. A document that has
+# any of them (or any other control character but tab and newline, or something that is not valid
+# UTF-8, which in a decoded string is a lone surrogate) is hidden whole: helm never renders them.
+_UNUSUAL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f  ﻿￾￿\ud800-\udfff]')
+COMMENTS_NOTE = '# comments are not shown'
+MAX_YAML_DEPTH = 64     # nesting beyond this is never shown (the dump below recurses in Python)
+_RESOLVER = yaml.resolver.Resolver()
+_CONSTRUCTOR = yaml.constructor.SafeConstructor()
+_STR_TAG = 'tag:yaml.org,2002:str'
 
-
-def _redact_secret(obj):
-    for key in ('data', 'stringData', 'binaryData'):
-        value = obj.get(key)
-        if isinstance(value, dict):
-            obj[key] = {k: HIDDEN for k in value}
-        elif value is not None:
-            obj[key] = HIDDEN
-    meta = obj.get('metadata')
-    if isinstance(meta, dict) and isinstance(meta.get('annotations'), dict) and _LAST_APPLIED in meta['annotations']:
-        meta['annotations'][_LAST_APPLIED] = HIDDEN
-
-
-def _split_comments(text):
-    """(leading comment lines, rest) of one manifest document. Walks the text by index so a
-    document of millions of tiny lines is never split into a list."""
-    comments = []
-    pos = 0
-    n = len(text)
-    while pos < n:
-        nl = text.find('\n', pos)
-        end = n if nl < 0 else nl
-        line = text[pos:end]
-        if line.strip() and not line.lstrip().startswith('#'):
-            break
-        if line.strip():
-            comments.append(line.rstrip())
-        pos = end + 1
-    return comments, text[pos:] if pos < n else ''
+# What the placeholder of a hidden document says.
+_R_CHARS = 'unusual characters'
+_R_BIG = 'document is too large to show'
+_R_DEEP = 'document is too deep to show'
+_R_TAGS = 'document uses YAML aliases, anchors, merge keys or tags'
+_R_DIRECTIVE = 'document uses YAML directives'
+_R_LIST = 'document is a list'
+_R_ODD = 'document is not a plain Kubernetes object'
+_R_PARSE = 'document could not be parsed'
 
 
-_SECRET = 'secret'      # a plain mapping of kind Secret: loaded, its values hidden
-_SHOW = 'show'          # a plain mapping of another kind: passed through as text
+class _Hidden(Exception):
+    """The document must be replaced whole by a placeholder; `args[0]` is the reason."""
 
 
 def _check_budget(deadline):
@@ -564,43 +558,34 @@ def _check_budget(deadline):
         raise Failure('too_large', 'This is too complex to read within the time limit.')
 
 
-MAX_YAML_DEPTH = 64     # libyaml composes nested nodes by C recursion: a deeper document is never loaded
-_RESOLVER = yaml.resolver.Resolver()
-_STR_TAG = 'tag:yaml.org,2002:str'
+def _scalar(ev):
+    """The Python value of a scalar event: quoted scalars are strings, plain ones are resolved like
+    yaml.safe_load does (a tag never reaches here: tags hide the document)."""
+    tag = _RESOLVER.resolve(yaml.ScalarNode, ev.value, ev.implicit)
+    if tag == _STR_TAG:
+        return ev.value
+    return _CONSTRUCTOR.yaml_constructors[tag](_CONSTRUCTOR, yaml.ScalarNode(tag, ev.value))
 
 
 def _is_plain_string(ev):
-    """True when the scalar event is a string without any tag (quoted, or plain text that YAML
-    does not read as a number, bool, null ...)."""
-    if ev.tag is not None:
-        return False
     return _RESOLVER.resolve(yaml.ScalarNode, ev.value, ev.implicit) == _STR_TAG
 
 
-def _hide(reason):
-    return None, reason, 0
+def _parse_document(body, deadline):
+    """Build the one YAML document in `body` out of libyaml's events, with nothing composed and no
+    recursion, and refuse (raise _Hidden) everything that two parsers could read differently or that
+    could carry a value around a redaction. Returns the plain dict, or None for a text that holds no
+    document at all (nothing but comments and blank lines).
 
-
-def _classify_document(body, deadline):
-    """Stream the YAML events of one document (nothing is composed, so memory and the C stack
-    stay flat) and decide, failing closed, what may be shown. Returns (verdict, reason, deepest):
-    verdict is _SECRET (load it and hide its values), _SHOW (pass the text through) or None
-    (hide the whole document, `reason` says why). `deepest` is the nesting seen for a document
-    that is not hidden (the whole stream is read, because nesting decides whether loading is safe).
-
-    Shown or redacted only: a plain mapping (exactly one YAML document) with a plain string `kind`
-    that is not repeated and does not end in List, and no top-level `items` key. Hidden whole:
-    any anchor, alias, merge key (`<<`) or tag anywhere, a list directly inside a list, a top-level
-    key that is not a plain string, a `kind` that is not a plain string, a top-level key that is
-    `kind` or `items` in other letter case, and anything that does not parse. A YAML error raises
-    yaml.YAMLError (the caller hides the document)."""
-    depth = 0
-    deepest = 0
-    stack = []                                 # 'map' / 'seq' of the open collections
+    Refused: a second document, a directive or an explicit `---`, any alias, anchor or tag (the standard
+    tags too), a merge key `<<` (quoted or not), a key given twice, a key that is not a plain string or
+    is a collection, a list directly in a list, nesting deeper than MAX_YAML_DEPTH, a root that is not
+    a mapping, a top-level key with a non-ASCII character (Go folds some of them to ASCII), a top-level
+    `items` or `kind` key in any other letter case, a `kind` that is missing, not a plain string or ends
+    in `list` (any letter case)."""
+    stack = []             # open collections: [container, pending key or None]
     documents = 0
-    expect_key = True
-    key = None
-    kind = None
+    root = None
     count = 0
     for ev in yaml.parse(body, Loader=_YAML_LOADER):
         count += 1
@@ -609,72 +594,116 @@ def _classify_document(body, deadline):
         if isinstance(ev, yaml.DocumentStartEvent):
             documents += 1
             if documents > 1:
-                return _hide('document has more than one YAML document')
+                raise _Hidden(_R_ODD)
+            if ev.explicit or ev.version is not None or ev.tags:
+                raise _Hidden(_R_DIRECTIVE)
             continue
         if isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
-            depth -= 1
             stack.pop()
-            if depth == 1:
-                expect_key = not expect_key
             continue
         if not isinstance(ev, (yaml.ScalarEvent, yaml.AliasEvent, yaml.MappingStartEvent,
                                yaml.SequenceStartEvent)):
-            continue                           # stream/document markers
-        if isinstance(ev, yaml.AliasEvent) or ev.anchor is not None:
-            return _hide('document uses a YAML anchor or alias')
-        if ev.tag is not None:
-            return _hide('document uses a YAML tag')
-        is_scalar = isinstance(ev, yaml.ScalarEvent)
-        if is_scalar and ev.value == '<<':
-            return _hide('document uses a YAML merge key')
-        if isinstance(ev, yaml.SequenceStartEvent) and stack and stack[-1] == 'seq':
-            return _hide('document has nested lists')
-        if depth == 0:
-            if not isinstance(ev, yaml.MappingStartEvent):
-                return _hide('document is not a mapping')
-        elif depth == 1:
-            if expect_key:
-                if not is_scalar or not _is_plain_string(ev):
-                    return _hide('document has a key that is not a plain string')
-                key = ev.value
+            continue                                   # stream and document end markers
+        if isinstance(ev, yaml.AliasEvent) or ev.anchor is not None or ev.tag is not None:
+            raise _Hidden(_R_TAGS)
+        scalar = isinstance(ev, yaml.ScalarEvent)
+        mapping = isinstance(ev, yaml.MappingStartEvent)
+        top = stack[-1] if stack else None
+        as_key = top is not None and isinstance(top[0], dict) and top[1] is None
+        if not stack and not mapping:
+            raise _Hidden(_R_ODD)                      # the root is not a mapping
+        if as_key:
+            if scalar and ev.value == '<<':
+                raise _Hidden(_R_TAGS)                 # a merge key, plain or quoted
+            if not scalar or not _is_plain_string(ev):
+                raise _Hidden(_R_ODD)                  # a complex key or one that is not a string
+            key = ev.value
+            if key in top[0]:
+                raise _Hidden(_R_ODD)
+            if len(stack) == 1:
+                if not key.isascii():
+                    raise _Hidden(_R_ODD)
                 lowered = key.lower()
                 if lowered == 'items':
-                    return _hide('document has a top-level items key')
-                if lowered == 'kind':
-                    if key != 'kind' or kind is not None:
-                        return _hide('document has an odd or repeated kind key')
-            elif key == 'kind':
-                if not is_scalar or not _is_plain_string(ev):
-                    return _hide('document has a kind that is not a plain string')
-                kind = ev.value
-        if not is_scalar:
-            depth += 1
-            deepest = max(deepest, depth)
-            stack.append('map' if isinstance(ev, yaml.MappingStartEvent) else 'seq')
-        elif depth == 1:
-            expect_key = not expect_key
-    if documents != 1:
-        return _hide('document is not a mapping')
-    if kind is None:
-        return _hide('document has no kind')
-    lowered = kind.lower()
-    if lowered.endswith('list'):
-        return _hide('document is a list kind')
-    return (_SECRET if lowered == 'secret' else _SHOW), None, deepest
+                    raise _Hidden(_R_LIST)
+                if lowered == 'kind' and key != 'kind':
+                    raise _Hidden(_R_ODD)
+            top[1] = key
+            continue
+        if scalar:
+            value = _scalar(ev)
+        else:
+            if not mapping and top is not None and isinstance(top[0], list):
+                raise _Hidden(_R_LIST)                 # a list directly in a list
+            if len(stack) >= MAX_YAML_DEPTH:
+                raise _Hidden(_R_DEEP)
+            value = {} if mapping else []
+        if top is None:
+            root = value
+        elif isinstance(top[0], list):
+            top[0].append(value)
+        else:
+            if len(stack) == 1 and top[1] == 'kind' and not (scalar and _is_plain_string(ev)):
+                raise _Hidden(_R_ODD)                  # the kind is a plain string
+            top[0][top[1]] = value
+            top[1] = None
+        if not scalar:
+            stack.append([value, None])
+    if documents == 0:
+        return None
+    kind = root.get('kind')
+    if not isinstance(kind, str):
+        raise _Hidden(_R_ODD)
+    if kind.strip().lower().endswith('list'):
+        raise _Hidden(_R_LIST)
+    return root
 
 
-def _fail_closed(obj):
-    """True when a loaded document is not a mapping with only string keys and a string `kind`.
-    The event scan already guarantees it; this is the second check on what was really built."""
-    if not isinstance(obj, dict):
-        return True
-    if any(not isinstance(k, str) for k in obj):
-        return True
-    return not isinstance(obj.get('kind'), str)
+def _is_secret(obj):
+    return obj['kind'].strip().lower() == 'secret'
+
+
+def _secret_view(obj):
+    """What may be shown of a Secret: apiVersion, kind, type and immutable as they are (when they are
+    plain scalars), the metadata without managedFields and without last-applied-configuration
+    annotations, and the keys of data, stringData and binaryData with their values hidden. Every
+    other top-level field is dropped (Kubernetes ignores them in a Secret)."""
+    out = {}
+    for key in ('apiVersion', 'kind', 'metadata', 'type', 'immutable', 'data', 'stringData', 'binaryData'):
+        if key not in obj:
+            continue
+        value = obj[key]
+        if key in ('data', 'stringData', 'binaryData'):
+            out[key] = {k: HIDDEN for k in value} if isinstance(value, dict) else HIDDEN
+        elif key == 'metadata':
+            if isinstance(value, dict):
+                out[key] = _metadata_view(value)
+        elif not isinstance(value, (dict, list)):
+            out[key] = value
+    return out
+
+
+def _metadata_view(meta):
+    out = {}
+    for key, value in meta.items():
+        lowered = key.lower() if key.isascii() else None
+        if lowered is None or lowered == 'managedfields':
+            continue                                   # non-ASCII keys could fold to either name
+        if lowered == 'annotations':
+            if not isinstance(value, dict):
+                continue
+            kept = {k: v for k, v in value.items() if k.isascii() and _LAST_APPLIED not in k.lower()}
+            if not kept and value:
+                continue                               # only last-applied-configuration was there
+            value = kept
+        out[key] = value
+    return out
 
 
 def _iter_documents(manifest):
-    """The text between `---` separator lines, one at a time (no list of them is built)."""
+    """The text between `---` separator lines, one at a time (no list of them is built). Only a
+    line of exactly `---` plus blanks separates; a chunk is contiguous text, so every character of
+    the manifest outside the separators is checked by the per-document character gate."""
     pos = 0
     for m in _DOC_SPLIT.finditer(manifest):
         yield manifest[pos:m.start()]
@@ -682,58 +711,51 @@ def _iter_documents(manifest):
     yield manifest[pos:]
 
 
+def _render_document(chunk, deadline):
+    """One manifest chunk -> the text to show, or None when it holds no document. The output is
+    always a re-serialization of the parsed object, never the original text."""
+    if _YAML_LOADER is None:
+        return '# <hidden: %s>' % _R_PARSE
+    try:
+        if _UNUSUAL.search(chunk):
+            raise _Hidden(_R_CHARS)
+        if len(chunk) > DOC_CAP or len(chunk.encode('utf-8')) > DOC_CAP:
+            raise _Hidden(_R_BIG)
+        obj = _parse_document(chunk, deadline)
+        if obj is None:
+            return None
+        if _is_secret(obj):
+            obj = _secret_view(obj)
+        # allow_unicode stays off: anything that came in through an escape ( , \x85 ...) goes
+        # out as an escape again, so the text shown never holds a character the gate refuses.
+        return yaml.safe_dump(obj, sort_keys=False, default_flow_style=False).rstrip('\n')
+    except Failure:
+        raise
+    except _Hidden as hidden:
+        return '# <hidden: %s>' % hidden.args[0]
+    except Exception:
+        return '# <hidden: %s>' % _R_PARSE
+
+
 def redact_manifest(manifest, deadline=None):
+    """The manifest as shown to people: every document re-serialized from the parsed object
+    (comments are dropped), Secrets reduced to their keys, whatever is odd hidden whole."""
     out = io.StringIO()
     written = 0
-
-    def emit(lines):
-        nonlocal written
-        doc = '---\n%s\n' % lines
-        written += len(doc)
-        if written > MANIFEST_CAP:             # characters never outnumber bytes
-            raise Failure('too_large', 'The rendered manifest is too large to read.')
-        out.write(doc)
-
     for chunk in _iter_documents(manifest):
         _check_budget(deadline)
         if not chunk.strip():
             continue
-        comments, body = _split_comments(chunk)
-        if not body.strip():
-            emit('\n'.join(comments))
+        shown = _render_document(chunk, deadline)
+        if shown is None:
             continue
-        try:
-            mode, reason, deepest = _classify_document(body, deadline)
-        except Failure:
-            raise
-        except Exception:
-            emit('\n'.join(comments + ['# <hidden: document could not be parsed>']))
-            continue
-        if mode is None:
-            emit('\n'.join(comments + ['# <hidden: %s>' % reason]))
-            continue
-        if mode == _SHOW:
-            emit(chunk.strip('\n'))
-            continue
-        if len(body) > SECRET_DOC_CAP or len(body.encode('utf-8')) > SECRET_DOC_CAP:
-            emit('\n'.join(comments + ['# <hidden: document too large to redact>']))
-            continue
-        if deepest > MAX_YAML_DEPTH:           # loading would recurse in C and can kill the process
-            emit('\n'.join(comments + ['# <hidden: document too deep to redact>']))
-            continue
-        try:
-            obj = yaml.load(body, Loader=_YAML_LOADER)
-        except Exception:
-            emit('\n'.join(comments + ['# <hidden: document could not be parsed>']))
-            continue
-        if _fail_closed(obj) or str(obj['kind']).lower() != 'secret':
-            emit('\n'.join(comments + ['# <hidden: document could not be checked for Secrets>']))
-            continue
-        # No anchors or aliases exist (the scan refused them), so nothing is shared between the
-        # values that are hidden and the rest of the document and the dump cannot bring it back.
-        _redact_secret(obj)
-        dumped = yaml.safe_dump(obj, sort_keys=False, default_flow_style=False, allow_unicode=True)
-        emit('\n'.join(comments + [dumped.rstrip('\n')]))
+        if not written:
+            out.write(COMMENTS_NOTE + '\n')
+        doc = '---\n%s\n' % shown
+        written += len(doc)
+        if written > MANIFEST_CAP:                     # characters never outnumber bytes
+            raise Failure('too_large', 'The rendered manifest is too large to read.')
+        out.write(doc)
     text = out.getvalue()
     if len(text.encode('utf-8')) > MANIFEST_CAP:
         raise Failure('too_large', 'The rendered manifest is too large to read.')
@@ -1284,6 +1306,11 @@ def make_inspect_app(config, principals, runner=None, **runner_kwargs):
 def start_inspect_listener(config, principals, port, **runner_kwargs):
     """Start the 8091 listener and the sweeper; returns (application, sweeper) or None when disabled."""
     if not principals:
+        return None
+    if _YAML_LOADER is None:
+        # Release manifests are redacted by parsing them: only with libyaml's parser, never the
+        # pure-Python one, so without it nothing is served.
+        logger.error("Inspect API not started: PyYAML was built without libyaml (CSafeLoader)")
         return None
     app = make_inspect_app(config, principals, **runner_kwargs)
     app.listen(port, address='0.0.0.0', max_body_size=LISTEN_MAX_BODY)

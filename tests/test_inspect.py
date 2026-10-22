@@ -510,41 +510,449 @@ class TestShaping(unittest.TestCase):
 
 
 class TestRelease(unittest.TestCase):
+    # --- manifest redaction: strict parse, re-serialization (plans/nextgen/inspect.md 3.4) ---
+
+    @staticmethod
+    def show(body):
+        return inspect_ops.redact_manifest('---\n' + body)
+
+    @staticmethod
+    def hidden_reason(text):
+        return [line for line in text.splitlines() if line.startswith('# <hidden: ')]
+
     def test_redaction(self):
         text = inspect_ops.redact_manifest(MANIFEST)
-        for leaked in ('aHVudGVyMg', 'YWRtaW4', 'plain-text-token', 'leaked-in-broken-doc', 'dmFsdWU', 'c3VwZXI'):
+        for leaked in ('aHVudGVyMg', 'YWRtaW4', 'plain-text-token', 'leaked-in-broken-doc', 'dmFsdWU', 'c3VwZXI',
+                       'visible', 'keep this comment', '# Source'):
             self.assertNotIn(leaked, text)
-        self.assertIn('# Source: nvr/templates/secret.yaml', text)
-        self.assertIn('# Source: nvr/templates/broken.yaml', text)
-        self.assertIn('# <hidden: document could not be parsed>', text)
-        self.assertIn('# keep this comment', text)               # untouched documents keep their text
+        self.assertEqual(text.splitlines()[0], '# comments are not shown')
+        self.assertEqual(text.count('# comments are not shown'), 1)
         self.assertIn('LOG_LEVEL: info', text)
-        self.assertNotIn('visible', text)                        # a document with top-level items is hidden whole
-        self.assertIn('# Source: nvr/templates/list.yaml', text)
-        self.assertIn('# <hidden: document has a top-level items key>', text)
-        self.assertEqual(text.count('<hidden>'), 4)              # 2 data + 1 stringData + annotation
+        self.assertEqual(self.hidden_reason(text), ['# <hidden: document could not be parsed>',
+                                                    '# <hidden: document is a list>'])
         import yaml
         docs = [d for d in yaml.safe_load_all(text) if d]
-        secret = docs[0]
-        self.assertEqual(secret['data'], {'password': '<hidden>', 'user': '<hidden>'})
-        self.assertEqual(secret['stringData'], {'token': '<hidden>'})
-        self.assertEqual(secret['metadata']['name'], 'nvr-db')
-        self.assertEqual(list(secret)[:3], ['apiVersion', 'kind', 'metadata'])   # order kept
+        self.assertEqual(docs[0], {
+            'apiVersion': 'v1', 'kind': 'Secret', 'metadata': {'name': 'nvr-db'}, 'type': 'Opaque',
+            'data': {'password': '<hidden>', 'user': '<hidden>'}, 'stringData': {'token': '<hidden>'}})
+        self.assertEqual(list(docs[0]), ['apiVersion', 'kind', 'metadata', 'type', 'data', 'stringData'])
+        self.assertEqual(docs[1]['data'], {'LOG_LEVEL': 'info'})
 
-    def test_secret_with_odd_shapes(self):
-        text = inspect_ops.redact_manifest('---\nkind: Secret\ndata: not-a-map\nbinaryData:\n  a: AAAA\n')
-        self.assertNotIn('not-a-map', text)
-        self.assertNotIn('AAAA', text)
+    def test_helm_like_manifest_still_renders(self):
+        import yaml
+        manifest = textwrap.dedent('''\
+            ---
+            # Source: web/templates/deployment.yaml
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: web
+              labels: {app: web}
+            spec:
+              replicas: 2
+              selector:
+                matchLabels: {app: web}
+              template:
+                metadata:
+                  labels: {app: web}
+                spec:
+                  containers:
+                  - name: web
+                    image: "ghcr.io/teknoir/web:1.2.0"
+                    args: ["--port", "8080"]
+                    env:
+                    - {name: LOG_LEVEL, value: "info"}
+                    ports:
+                    - containerPort: 8080
+            ---
+            # Source: web/templates/service.yaml
+            apiVersion: v1
+            kind: Service
+            metadata:
+              name: web
+            spec:
+              ports:
+              - port: 80
+                targetPort: 8080
+              selector: {app: web}
+            ---
+            # Source: web/templates/configmap.yaml
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: web
+            data:
+              config.json: |
+                {"a": 1,
+                 "b": [1, 2]}
+              note: "plain # not a comment"
+            ---
+            # Source: web/templates/secret.yaml
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: web
+              labels: {app: web}
+            type: Opaque
+            data:
+              password: aHVudGVyMg==
+        ''')
+        text = inspect_ops.redact_manifest(manifest)
+        self.assertNotIn('aHVudGVyMg', text)
+        shown = [d for d in yaml.safe_load_all(text) if d]
+        expected = [d for d in yaml.safe_load_all(manifest) if d]
+        expected[3]['data'] = {'password': '<hidden>'}
+        self.assertEqual(shown, expected)
+        self.assertEqual([d['kind'] for d in shown], ['Deployment', 'Service', 'ConfigMap', 'Secret'])
+        self.assertEqual(self.hidden_reason(text), [])
+        self.assertEqual(shown[2]['data']['config.json'], '{"a": 1,\n "b": [1, 2]}\n')
 
-    def test_multi_document_chunk_fails_closed(self):
-        text = inspect_ops.redact_manifest('--- !!map\nkind: Secret\ndata: {a: SECRETVALUE}\n--- !!map\nb: 1\n')
-        self.assertNotIn('SECRETVALUE', text)
+    def test_output_is_a_reserialization_not_the_original_text(self):
+        text = self.show('# lead\nkind: ConfigMap  # trailing\ndata: {a: 1, b: "x"}   # more\n')
+        self.assertEqual(text, '# comments are not shown\n---\nkind: ConfigMap\ndata:\n  a: 1\n  b: x\n')
+        self.assertEqual(inspect_ops.redact_manifest(''), '')
+        self.assertEqual(inspect_ops.redact_manifest('---\n# only a comment\n---\n\n'), '')
+
+    def test_comment_lines_carrying_a_key_block_are_dropped(self):
+        body = ('kind: ConfigMap\n# -----BEGIN RSA PRIVATE KEY-----\n# MIIEowIBAAKCAQEAKEYBODY\n'
+                '# -----END RSA PRIVATE KEY-----\ndata: {a: b}\n')
+        text = self.show('# -----BEGIN PRIVATE KEY-----\n' + body)
+        self.assertNotIn('KEYBODY', text)
+        self.assertNotIn('PRIVATE KEY', text)
+        self.assertIn('a: b', text)
+
+    # The parsers Kubernetes uses treat \r, U+0085, U+2028 and U+2029 as line breaks and skip a BOM at
+    # any line start; a redactor that does not hid a Secret in a 'comment' or a plain scalar.
+    UNUSUAL = {
+        'cr': '\r', 'nel': '\x85', 'line separator': '\u2028', 'paragraph separator': '\u2029',
+        'bom': '\ufeff', 'bell': '\x07', 'nul': '\x00', 'escape': '\x1b', 'vertical tab': '\x0b',
+        'form feed': '\x0c', 'del': '\x7f', 'c1 control': '\x9b', 'noncharacter': '\uffff',
+        'lone surrogate': '\ud800',
+    }
+
+    def test_unusual_characters_hide_the_document_whole(self):
+        for name, ch in self.UNUSUAL.items():
+            bodies = {
+                'comment': 'kind: ConfigMap\n#%s\nkind: Secret\ndata: {a: LEAK1}\n' % ch,
+                'plain scalar': 'kind: ConfigMap\ndata: x%s\nkind: Secret\nstringData: {a: LEAK1}\n' % ch,
+                'bom first': ch + 'kind: Secret\ndata: {a: LEAK1}\n',
+                'bom at a line start': 'kind: ConfigMap\n' + ch + 'kind: Secret\ndata: {a: LEAK1}\n',
+                'in a key': 'kind: Secret\ndata: {a: LEAK1}\nx%s: 1\n' % ch,
+            }
+            for where, body in bodies.items():
+                text = inspect_ops.redact_manifest(
+                    '---\nkind: ConfigMap\ndata: {before: shown}\n---\n' + body + '---\nkind: ConfigMap\ndata: {after: shown}\n')
+                case = (name, where)
+                self.assertNotIn('LEAK1', text, case)
+                self.assertEqual(self.hidden_reason(text), ['# <hidden: unusual characters>'], case)
+                self.assertIn('before: shown', text, case)       # the other documents are still shown
+                self.assertIn('after: shown', text, case)
+
+    def test_unusual_characters_cannot_hide_behind_a_separator(self):
+        # a line that is `---` plus a CR is not a separator for this splitter: the whole chunk is hidden
+        text = inspect_ops.redact_manifest('---\r\nkind: Secret\r\ndata: {a: LEAK1}\r\n---\r\nkind: Secret\ndata: {a: LEAK2}\n')
+        self.assertNotIn('LEAK', text)
+        self.assertEqual(self.hidden_reason(text), ['# <hidden: unusual characters>'])
+
+    def test_what_comes_in_through_an_escape_goes_out_as_an_escape(self):
+        text = self.show('kind: ConfigMap\ndata:\n  a: "x\\u2028y\\u0085z\\rq\\ufeff"\n')
+        self.assertEqual(self.hidden_reason(text), [])
+        self.assertIsNone(inspect_ops._UNUSUAL.search(text))
+        import yaml
+        self.assertEqual(list(yaml.safe_load_all(text))[0]['data']['a'], 'x\u2028y\x85z\rq\ufeff')
+
+    def test_anchors_aliases_and_tags_hide_the_document_on_every_node_type(self):
+        s = 'kind: Secret\ndata: {a: LEAK1}\n'
+        cases = {
+            'anchor on the root': '&r\n' + s,
+            'tag on the root': '!!map\n' + s,
+            'custom tag on the root': '!custom\n' + s,
+            'anchor on a map': s + 'm: &m {k: v}\n',
+            'anchor on a map, block': s + 'm: &m\n  k: v\n',
+            'tag on a map': s + 'm: !!map {k: v}\n',
+            'custom tag on a map': s + 'm: !foo {k: v}\n',
+            'anchor on a sequence': s + 'l: &l [a, b]\n',
+            'tag on a sequence': s + 'l: !!seq [a, b]\n',
+            'custom tag on a sequence': s + 'l: !foo [a]\n',
+            'anchor on a scalar': s + 'x: &x v\n',
+            'tag on a scalar': s + 'x: !!str v\n',
+            'tag on the kind': 'kind: !!str Secret\ndata: {a: LEAK1}\n',
+            'tag on a key': '!!str kind: Secret\ndata: {a: LEAK1}\n',
+            'binary kind': 'kind: !!binary U2VjcmV0\ndata: {a: LEAK1}\n',
+            'alias': 'a: &a v\n' + s + 'b: *a\n',
+            'alias of the data': 'kind: Secret\ndata: &d {a: LEAK1}\nbackup: *d\n',
+            'anchor on a Secret list item': 'kind: ConfigMap\nl:\n- &i {a: LEAK1}\n',
+            'anchor in a sequence item': 'kind: ConfigMap\nl:\n- &i x\n- *i\n',
+            'non-specific tag': 'kind: ConfigMap\nx: ! LEAK1\n',
+        }
+        for name, body in cases.items():
+            text = self.show(body)
+            self.assertNotIn('LEAK1', text, name)
+            self.assertEqual(self.hidden_reason(text),
+                             ['# <hidden: document uses YAML aliases, anchors, merge keys or tags>'], name)
+
+    def test_yaml_directives_hide_the_document(self):
+        for name, manifest in {
+            'inside a chunk': '---\nkind: ConfigMap\n...\n%YAML 1.1\n--- {kind: Secret, data: {a: LEAK1}}\n',
+            'explicit start with content': '--- {kind: Secret, data: {a: LEAK1}}\n',
+            'explicit start with a tag': '--- !!map\nkind: Secret\ndata: {a: LEAK1}\n',
+            'YAML directive': '%YAML 1.1\n--- {kind: Secret, data: {a: LEAK1}}\n',
+            'TAG directive': '%TAG ! tag:example.com,2000:\n--- !x {kind: Secret, data: {a: LEAK1}}\n',
+            'directive then a plain document': '%YAML 1.1\n---\nkind: Secret\ndata: {a: LEAK1}\n',
+        }.items():
+            text = inspect_ops.redact_manifest(manifest)
+            self.assertNotIn('LEAK1', text, name)
+            self.assertTrue(self.hidden_reason(text), name)
+        self.assertEqual(self.hidden_reason(inspect_ops.redact_manifest('--- {kind: ConfigMap}\n')),
+                         ['# <hidden: document uses YAML directives>'])
+
+    def test_merge_keys_hide_the_document_quoted_or_not(self):
+        for key in ('<<', '"<<"', "'<<'"):
+            for body in ('kind: ConfigMap\nbase: {kind: Secret}\n%s: {kind: Secret}\ndata: {a: LEAK1}\n' % key,
+                         'kind: ConfigMap\ndata:\n  %s: {a: LEAK1}\n' % key):
+                text = self.show(body)
+                self.assertNotIn('LEAK1', text, key)
+                self.assertEqual(self.hidden_reason(text),
+                                 ['# <hidden: document uses YAML aliases, anchors, merge keys or tags>'], key)
+
+    def test_kind_is_compared_case_insensitively(self):
+        for kind in ('secret', 'SECRET', 'Secret', 'sEcReT', ' Secret ', '"secret"'):
+            text = self.show('kind: %s\nmetadata: {name: x}\ndata: {a: LEAK1}\nstringData: {b: LEAK2}\n'
+                             'unknown: LEAK3\n' % kind)
+            self.assertNotIn('LEAK', text, kind)
+            self.assertNotIn('unknown', text, kind)
+            self.assertIn('a: <hidden>', text, kind)
+            self.assertIn('b: <hidden>', text, kind)
+        self.assertNotIn('LEAK', self.show('kind: secretlist\nitems: [{kind: Secret, data: {a: LEAK1}}]\n'))
+
+    def test_a_secret_shows_only_its_allowed_fields(self):
+        text = self.show(textwrap.dedent('''\
+            apiVersion: v1
+            kind: secret
+            metadata:
+              name: db
+              namespace: n
+              labels: {app: db}
+              annotations:
+                keep: me
+                kubectl.kubernetes.io/last-applied-configuration: '{"data":{"pw":"LEAK1"}}'
+              managedFields: [{manager: kubectl, fieldsV1: {"f:data": {"f:pw": {}}}}]
+            type: Opaque
+            immutable: true
+            data: {pw: LEAK2, user: LEAK3}
+            stringData: {token: LEAK4}
+            binaryData: {blob: LEAK5}
+            extra: LEAK6
+            Data: {pw: LEAK7}
+            spec: {nested: LEAK8}
+            '''))
+        self.assertNotIn('LEAK', text)
+        self.assertNotIn('last-applied', text)
+        self.assertNotIn('managedFields', text)
+        import yaml
+        obj = list(yaml.safe_load_all(text))[0]
+        self.assertEqual(obj, {
+            'apiVersion': 'v1', 'kind': 'secret',
+            'metadata': {'name': 'db', 'namespace': 'n', 'labels': {'app': 'db'}, 'annotations': {'keep': 'me'}},
+            'type': 'Opaque', 'immutable': True,
+            'data': {'pw': '<hidden>', 'user': '<hidden>'}, 'stringData': {'token': '<hidden>'},
+            'binaryData': {'blob': '<hidden>'}})
+        self.assertEqual(list(obj), ['apiVersion', 'kind', 'metadata', 'type', 'immutable', 'data', 'stringData',
+                                     'binaryData'])
+
+    def test_a_secret_with_odd_values_for_its_fields(self):
+        for body in ('kind: Secret\ndata: LEAK1\n', 'kind: Secret\ndata: [LEAK1]\n', 'kind: Secret\nstringData: 7\n',
+                     'kind: Secret\nmetadata: LEAK1\n', 'kind: Secret\ntype: {a: LEAK1}\n',
+                     'kind: Secret\nmetadata:\n  annotations: LEAK1\n', 'kind: Secret\ndata: {a: {b: LEAK1}}\n',
+                     'kind: Secret\nimmutable: [LEAK1]\n', 'kind: Secret\nmetadata:\n  Annotations:\n'
+                     '    kubectl.kubernetes.io/last-applied-configuration: LEAK1\n',
+                     'kind: Secret\nmetadata:\n  annotations:\n'
+                     '    Kubectl.Kubernetes.Io/Last-Applied-Configuration: LEAK1\n'):
+            text = self.show(body)
+            self.assertNotIn('LEAK1', text, body)
+            self.assertEqual(self.hidden_reason(text), [], body)
+
+    def test_top_level_keys_that_could_fold_to_kind_or_items_hide_the_document(self):
+        # Go decoders match field names case-insensitively, and fold some non-ASCII letters to ASCII
+        for key in ('Kind', 'KIND', 'kInD', 'Items', 'ITEMS', 'items', '\u0131tems', '\u212aind', 'kind\u0131',
+                    '\u017ftringData', 'data\u200b'):
+            text = self.show('kind: ConfigMap\n%s: Secret\ndata: {a: LEAK1}\n' % key)
+            self.assertNotIn('LEAK1', text, key)
+            self.assertEqual(len(self.hidden_reason(text)), 1, key)
+        # non-ASCII below the top level is fine
+        text = self.show('kind: ConfigMap\ndata: {caf\u00e9: ok}\n')
+        self.assertEqual(self.hidden_reason(text), [])
+        self.assertIn('caf\\xE9": ok', text)
+
+    def test_keys_must_be_unique_plain_strings(self):
+        for body in ('kind: ConfigMap\nkind: Secret\ndata: {a: LEAK1}\n',
+                     'kind: Secret\ndata: {a: LEAK1}\ndata: {b: x}\n',
+                     'kind: ConfigMap\ndata: {a: LEAK1, a: x}\n',
+                     'kind: ConfigMap\ndata: {"a": LEAK1, a: x}\n',
+                     'kind: ConfigMap\ndata:\n  1: LEAK1\n', 'kind: ConfigMap\ndata:\n  null: LEAK1\n',
+                     'kind: ConfigMap\ndata:\n  ~: LEAK1\n', 'kind: ConfigMap\ndata:\n  true: LEAK1\n',
+                     'kind: ConfigMap\ndata:\n  1.5: LEAK1\n', 'kind: ConfigMap\ndata:\n  ? [a]\n  : LEAK1\n',
+                     'kind: ConfigMap\ndata:\n  ? {a: b}\n  : LEAK1\n', 'kind: ConfigMap\ndata:\n  ?\n  : LEAK1\n',
+                     '1: x\nkind: ConfigMap\ndata: {a: LEAK1}\n', '? [a]\n: b\nkind: ConfigMap\ndata: {a: LEAK1}\n'):
+            text = self.show(body)
+            self.assertNotIn('LEAK1', text, body)
+            self.assertEqual(self.hidden_reason(text), ['# <hidden: document is not a plain Kubernetes object>'], body)
+        self.assertEqual(self.hidden_reason(self.show('kind: ConfigMap\ndata: {"1": a, "true": b}\n')), [])
+
+    def test_the_kind_must_be_a_plain_string_and_not_a_list_kind(self):
+        for body in ('data: {a: LEAK1}\n', 'kind: 7\ndata: {a: LEAK1}\n', 'kind: null\ndata: {a: LEAK1}\n',
+                     'kind:\ndata: {a: LEAK1}\n', 'kind: [Secret]\ndata: {a: LEAK1}\n',
+                     'kind: {a: b}\ndata: {a: LEAK1}\n', 'kind: true\ndata: {a: LEAK1}\n',
+                     'kind: List\nitems: [{kind: Secret, data: {a: LEAK1}}]\n',
+                     'kind: SecretList\ndata: {a: LEAK1}\n', 'kind: secretlist\ndata: {a: LEAK1}\n',
+                     'kind: ConfigMapLIST\ndata: {a: LEAK1}\n', 'kind: ConfigMap\nitems: []\nx: LEAK1\n'):
+            text = self.show(body)
+            self.assertNotIn('LEAK1', text, body)
+            self.assertIn(self.hidden_reason(text), (['# <hidden: document is a list>'],
+                                                     ['# <hidden: document is not a plain Kubernetes object>']), body)
+
+    def test_documents_that_are_not_mappings_are_hidden(self):
+        for body in ('- kind: Secret\n  data: {a: LEAK1}\n', 'LEAK1 as a scalar\n', '"LEAK1"\n', '[LEAK1]\n', '7\n',
+                     'null\n'):
+            text = self.show(body)
+            self.assertNotIn('LEAK1', text, body)
+            self.assertEqual(self.hidden_reason(text), ['# <hidden: document is not a plain Kubernetes object>'], body)
+
+    def test_more_than_one_yaml_document_in_a_chunk_is_hidden(self):
+        for body in ('kind: ConfigMap\n...\nkind: Secret\ndata: {a: LEAK1}\n',
+                     'kind: ConfigMap\n--- #\nkind: Secret\ndata: {a: LEAK1}\n',
+                     'kind: ConfigMap\n...\n--- !!map\nkind: Secret\ndata: {a: LEAK1}\n'):
+            text = self.show(body)
+            self.assertNotIn('LEAK1', text, body)
+            self.assertIn(self.hidden_reason(text), (['# <hidden: document is not a plain Kubernetes object>'],
+                                                     ['# <hidden: document could not be parsed>']), body)
+
+    def test_nested_lists_and_items_are_hidden(self):
+        secret = '{kind: Secret, data: {password: LEAK1}, stringData: {token: LEAK2}}'
+        for body in ('kind: List\nitems:\n- - %s\n' % secret, 'kind: ConfigMap\ndata: [[%s]]\n' % secret,
+                     'kind: Deployment\nspec:\n  x:\n  - - %s\n' % secret, 'kind: ConfigMap\nx: [[[%s]]]\n' % secret,
+                     'kind: Whatever\nitems: [%s]\n' % secret, 'kind: Secret\ndata: {a: LEAK1}\nitems: [x]\n',
+                     'items: [%s]\n' % secret, 'kind: ConfigMap\nITEMS: [%s]\n' % secret,
+                     'kind: SecretList\nitems: [%s]\n' % secret):
+            text = self.show(body)
+            self.assertNotIn('LEAK', text, body)
+            self.assertEqual(len(self.hidden_reason(text)), 1, body)
+            self.assertNotIn('kind:', text, body)
+        self.assertEqual(self.hidden_reason(self.show('kind: ConfigMap\nx: [{a: [1]}, [2][0]]\n'))[:1],
+                         ['# <hidden: document is a list>'])
+
+    def test_a_hidden_document_does_not_stop_the_others(self):
+        text = inspect_ops.redact_manifest(
+            '---\nkind: List\nitems: [[LEAK1]]\n---\nkind: ConfigMap\ndata: {a: shown}\n'
+            '---\nkind: Secret\ndata: {a: LEAK2}\n---\n&a x: y\n---\nkind: Service\n')
+        self.assertNotIn('LEAK', text)
+        self.assertIn('a: shown', text)
+        self.assertIn('a: <hidden>', text)
+        self.assertIn('kind: Service', text)
+        self.assertEqual(len(self.hidden_reason(text)), 2)
+
+    def test_the_hidden_placeholders_carry_no_content(self):
+        text = self.show('kind: Secret\ndata: &d {a: LEAK1}\n')
+        self.assertEqual(text, '# comments are not shown\n---\n# <hidden: document uses YAML aliases, anchors, merge keys or tags>\n')
+
+    def test_without_libyaml_every_document_is_hidden_and_the_listener_stays_off(self):
+        orig = inspect_ops._YAML_LOADER
+        inspect_ops._YAML_LOADER = None
+        self.addCleanup(setattr, inspect_ops, '_YAML_LOADER', orig)
+        text = inspect_ops.redact_manifest(MANIFEST)
+        self.assertNotIn('LOG_LEVEL', text)
+        self.assertEqual(len(self.hidden_reason(text)), 4)
+        self.assertIsNone(inspect_ops.start_inspect_listener(None, [PRINCIPAL], 0))
+
+    def test_the_parser_is_libyaml(self):
+        self.assertIs(inspect_ops._YAML_LOADER, inspect_ops.yaml.CSafeLoader)
 
     def test_redacted_manifest_over_cap(self):
-        big = '---\nkind: ConfigMap\ndata:\n  k: "%s"\n' % ('x' * (inspect_ops.MANIFEST_CAP + 10))
+        doc = '---\nkind: ConfigMap\ndata:\n  k: "%s"\n' % ('x' * 100000)
+        manifest = doc * (inspect_ops.MANIFEST_CAP // len(doc) + 2)
         with self.assertRaises(inspect_ops.Failure) as cm:
-            inspect_ops.redact_manifest(big)
+            inspect_ops.redact_manifest(manifest)
         self.assertEqual(cm.exception.code, 'too_large')
+
+    def test_a_document_over_the_cap_is_hidden_unparsed(self):
+        orig = inspect_ops.yaml.parse
+
+        def boom(*a, **k):
+            raise AssertionError('parsed')
+        inspect_ops.yaml.parse = boom
+        try:
+            for kind in ('Secret', 'ConfigMap'):
+                body = 'kind: %s\ndata:\n  a: LEAK1\n  pad: "%s"\n' % (kind, 'x' * inspect_ops.DOC_CAP)
+                text = self.show(body)
+                self.assertNotIn('LEAK1', text)
+                self.assertEqual(self.hidden_reason(text), ['# <hidden: document is too large to show>'])
+        finally:
+            inspect_ops.yaml.parse = orig
+        small = self.show('kind: Secret\ndata:\n  a: LEAK1\n')
+        self.assertIn('a: <hidden>', small)
+
+    def test_deep_documents_are_hidden_and_never_recurse(self):
+        for depth in (70, 5000, 20000):
+            for name, doc in (
+                    ('maps', 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * depth + '1' + '}' * depth + '\n'),
+                    ('block maps', 'kind: ConfigMap\nx:\n' + ''.join('%sa:\n' % (' ' * (i + 1)) for i in range(min(depth, 300)))
+                     + ' ' * 400 + 'b: LEAK1\n'),
+                    ('lists', 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '[' * depth + ']' * depth + '\n'),
+                    ('lists of maps', 'kind: ConfigMap\nx: ' + '[{a: ' * depth + '1' + '}]' * depth + '\n')):
+                text = self.on_small_stack(inspect_ops.redact_manifest, '---\n' + doc)
+                self.assertNotIn('LEAK1', text, (name, depth))
+                self.assertEqual(len(self.hidden_reason(text)), 1, (name, depth))
+
+    def test_moderate_nesting_is_shown(self):
+        nested = 'x: ' + '{a: ' * 30 + '1' + '}' * 30 + '\n'
+        text = self.on_small_stack(inspect_ops.redact_manifest, '---\nkind: Secret\ndata: {a: LEAK1}\n' + nested)
+        self.assertNotIn('LEAK1', text)
+        self.assertEqual(self.hidden_reason(text), [])
+        self.assertIn('a: <hidden>', text)
+
+    def test_deep_secret_in_a_release_is_survived(self):
+        doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * 1000 + '1' + '}' * 1000 + '\n'
+        out = self.on_small_stack(
+            inspect_ops.shape_release, helm_release('---\n' + doc), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3)
+        self.assertNotIn('LEAK1', out['manifest'])
+        self.assertIn('document is too deep to show', out['manifest'])
+
+    def test_large_documents_stay_within_memory_and_time(self):
+        # Documents are built into objects now, so the per-document cap is what bounds them: just
+        # under the cap (shown) and just over it (hidden unparsed), with many tiny documents too.
+        probe = textwrap.dedent('''\
+            import resource, sys, time
+            sys.path.insert(0, sys.argv[1])
+            import inspect_ops
+            variant = sys.argv[2]
+            cap = inspect_ops.DOC_CAP
+            if variant == 'flow':
+                body = 'kind: ConfigMap\\nx: [' + ','.join(['1'] * (cap // 2 - 20)) + ']\\n'
+            elif variant == 'block':
+                body = 'kind: ConfigMap\\nx:\\n' + '- {a: b}\\n' * (cap // 9 - 10)
+            elif variant == 'over':
+                body = 'kind: ConfigMap\\nx:\\n' + '- a\\n' * (cap // 4 + 10)
+            else:    # many tiny documents
+                body = '---\\n'.join('kind: ConfigMap\\n' for _ in range(50000))
+            manifest = '---\\n' + body
+            assert len(manifest) <= inspect_ops.MANIFEST_CAP, len(manifest)
+            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            started = time.monotonic()
+            try:
+                out = inspect_ops.redact_manifest(manifest, time.monotonic() + 30)
+                ok = ('hidden: document is too large' in out) if variant == 'over' else out.startswith('# comments')
+            except inspect_ops.Failure as f:
+                ok = f.code == 'too_large' and variant == 'tiny'
+            after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            print(ok, (after - before) // 1024, round(time.monotonic() - started, 2))
+        ''')
+        app_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app')
+        for variant in ('flow', 'block', 'over', 'tiny'):
+            out = subprocess.run([sys.executable, '-c', probe, app_dir, variant], capture_output=True,
+                                 text=True, timeout=120, check=True).stdout.split()
+            self.assertEqual(out[0], 'True', variant)
+            self.assertLess(int(out[1]), 80, '%s grew by %s MiB' % (variant, out[1]))
+            self.assertLess(float(out[2]), 10, '%s took %s s' % (variant, out[2]))
 
     def test_decode_drops_everything_else(self):
         rows = [(3, 'deployed'), (2, 'superseded'), (1, 'superseded')]
@@ -591,23 +999,6 @@ class TestRelease(unittest.TestCase):
         self.assertEqual(cm.exception.code, 'too_large')
         self.assertLess(time.monotonic() - started, 2)
 
-    def test_sensitive_documents_are_found_without_composing_them(self):
-        cases = {
-            'flow': 'kind: Secret\ndata: {a: LEAK1}\n',
-            'quoted': '"kind": "Secret"\ndata:\n  a: LEAK1\n',
-            'kind last': 'metadata:\n  name: x\ndata:\n  a: LEAK1\nkind: Secret\n',
-            'duplicate kind': 'kind: Secret\ndata:\n  a: LEAK1\nkind: ConfigMap\n',
-            'merge key': 'base: &b {kind: Secret}\n<<: *b\ndata:\n  a: LEAK1\n',
-            'alias key': '&k kind: ignored\n*k : Secret\ndata:\n  a: LEAK1\n',
-            'kind is an alias': 'x: &k Secret\nkind: *k\ndata:\n  a: LEAK1\n',
-            'list': 'kind: SecretList\nitems:\n- kind: Secret\n  data: {a: LEAK1}\n',
-            'second document': 'kind: ConfigMap\n...\n--- !!map\nkind: Secret\ndata: {a: LEAK1}\n',
-        }
-        for name, body in cases.items():
-            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
-            self.assertNotIn('LEAK1', text, name)
-            self.assertIn('# Source: x', text, name)
-
     @staticmethod
     def on_small_stack(fn, *args):
         """Run fn on a thread with a 1 MiB stack, like the worker thread on python:alpine (musl);
@@ -630,68 +1021,6 @@ class TestRelease(unittest.TestCase):
             raise box['error']
         return box['value']
 
-    def test_deeply_nested_documents_never_reach_the_c_loader(self):
-        for depth in (5000, 20000):
-            for name, doc in (
-                    ('secret', 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '[' * depth + ']' * depth + '\n'),
-                    ('list', 'kind: SecretList\nitems: ' + '[' * depth + ']' * depth + '\n'),
-                    ('kind last', 'x: ' + '[' * depth + ']' * depth + '\nkind: Secret\n')):
-                text = self.on_small_stack(inspect_ops.redact_manifest, '---\n# Source: x\n' + doc)
-                self.assertIn('<hidden: ', text, (name, depth))      # nested lists and items: hidden whole
-                self.assertIn('# Source: x', text)
-                self.assertNotIn('LEAK1', text)
-            doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * (depth // 5) + '1' + '}' * (depth // 5) + '\n'
-            text = self.on_small_stack(inspect_ops.redact_manifest, '---\n# Source: x\n' + doc)
-            self.assertIn('# <hidden: document too deep to redact>', text, depth)
-            self.assertIn('# Source: x', text)
-            self.assertNotIn('LEAK1', text)
-
-    def test_deep_documents_that_are_not_sensitive_pass_as_text(self):
-        doc = 'kind: ConfigMap\nx: ' + '{a: ' * 4000 + '1' + '}' * 4000 + '\n'
-        text = self.on_small_stack(inspect_ops.redact_manifest, '---\n' + doc)
-        self.assertIn('kind: ConfigMap', text)
-        self.assertNotIn('<hidden', text)
-
-    def test_moderate_nesting_is_still_redacted(self):
-        nested = 'x: ' + '{a: ' * 30 + '1' + '}' * 30 + '\n'
-        text = self.on_small_stack(inspect_ops.redact_manifest, '---\nkind: Secret\ndata: {a: LEAK1}\n' + nested)
-        self.assertNotIn('LEAK1', text)
-        self.assertNotIn('too deep', text)
-        self.assertIn('a: <hidden>', text)
-
-    def test_deep_secret_in_a_release_is_survived(self):
-        doc = 'kind: Secret\ndata: {a: LEAK1}\nx: ' + '{a: ' * 1000 + '1' + '}' * 1000 + '\n'
-        out = self.on_small_stack(
-            inspect_ops.shape_release, helm_release('---\n' + doc), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3)
-        self.assertNotIn('LEAK1', out['manifest'])
-        self.assertIn('too deep', out['manifest'])
-
-    def test_tagged_kind_and_keys_are_still_secrets(self):
-        # sigs.k8s.io/yaml decodes !!binary to a string, so Kubernetes reads all of these as Secrets
-        cases = {
-            'tagged kind': 'kind: !!binary U2VjcmV0\ndata: {password: LEAK1}\nstringData: {token: LEAK2}\n',
-            'tagged key': '!!binary a2luZA==: Secret\ndata: {password: LEAK1}\nstringData: {token: LEAK2}\n',
-            'tagged str kind': 'kind: !!str Secret\ndata: {password: LEAK1}\nstringData: {token: LEAK2}\n',
-            'tagged list kind': 'kind: List\nitems:\n- kind: !!binary U2VjcmV0\n  data: {password: LEAK1}\n'
-                                '  stringData: {token: LEAK2}\n',
-            'tagged list item key': 'kind: List\nitems:\n- !!binary a2luZA==: Secret\n  data: {password: LEAK1}\n'
-                                    '  stringData: {token: LEAK2}\n',
-            'tagged list kind of list': 'kind: !!binary U2VjcmV0TGlzdA==\nitems:\n- kind: Secret\n'
-                                        '  data: {password: LEAK1}\n  stringData: {token: LEAK2}\n',
-        }
-        for name, body in cases.items():
-            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
-            self.assertNotIn('LEAK1', text, name)
-            self.assertNotIn('LEAK2', text, name)
-            self.assertIn('# Source: x', text, name)
-
-    def test_loaded_document_that_is_not_a_plain_mapping_is_hidden(self):
-        # even when the scan let it through, the second check on the built object fails closed
-        for obj in ({b'kind': 'Secret'}, {'kind': b'Secret'}, {'kind': 3}, {}, [b'x'], 'x', None):
-            self.assertTrue(inspect_ops._fail_closed(obj), obj)
-        for obj in ({'kind': 'Secret'}, {'kind': 'ConfigMap', 'data': {1: 2}}):
-            self.assertFalse(inspect_ops._fail_closed(obj), obj)
-
     def test_release_json_nested_too_deep_is_a_contract_error(self):
         rel = '{"name":"nvr","namespace":"teknoir-demo","version":3,"manifest":"","x":%s%s}' % (
             '[' * 300000, ']' * 300000)
@@ -705,98 +1034,6 @@ class TestRelease(unittest.TestCase):
             inspect_ops._json('[' * 300000 + ']' * 300000)
         self.assertIn(cm.exception.code, ('too_large', 'device_error'))
 
-    def test_secret_values_never_come_back_through_an_alias(self):
-        # yaml.load resolves the alias, the redaction hides `data`, but safe_dump used to write the
-        # aliased copy in plain text. Any anchor, alias, merge key or tag hides the whole document.
-        cases = {
-            'alias in a Secret': 'kind: Secret\ndata: &d {password: LEAK1}\nbackup: *d\n',
-            'alias in annotations': 'kind: Secret\nmetadata:\n  annotations: &a {x: LEAK1}\n  labels: *a\n'
-                                    'stringData: {token: LEAK2}\n',
-            'anchor only': 'kind: Secret\ndata: &d {password: LEAK1}\n',
-            'anchor on a scalar': 'kind: Secret\ndata: {password: &p LEAK1}\nstringData: {x: *p}\n',
-            'merge key': 'kind: Secret\nbase: &b {k: LEAK1}\ndata:\n  <<: *b\n',
-            'merge key only': 'kind: Secret\ndata:\n  <<: {k: LEAK1}\n',
-            'alias in a ConfigMap': 'kind: ConfigMap\ndata: &d {password: LEAK1}\ncopy: *d\n',
-            'anchored kind': 'kind: &k Secret\ndata: {password: LEAK1}\n',
-        }
-        for name, body in cases.items():
-            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
-            self.assertNotIn('LEAK1', text, name)
-            self.assertNotIn('LEAK2', text, name)
-            self.assertIn('# Source: x', text, name)
-            self.assertIn('# <hidden: document uses a YAML', text, name)
-
-    def test_documents_with_items_or_list_kinds_or_nested_lists_are_hidden_whole(self):
-        secret = '{kind: Secret, data: {password: LEAK1}, stringData: {token: LEAK2}}'
-        cases = {
-            'items of lists': 'kind: List\nitems:\n- - %s\n' % secret,
-            'items of lists, flow': 'kind: List\nitems: [[%s]]\n' % secret,
-            'items of lists in lists': 'kind: SecretList\nitems: [[[%s]]]\n' % secret,
-            'Secret list': 'kind: SecretList\nitems: [%s]\n' % secret,
-            'List of one': 'kind: List\nitems:\n- %s\n' % secret,
-            'unknown kind with items': 'kind: Whatever\nitems: [%s]\n' % secret,
-            'ConfigMap with items': 'kind: ConfigMap\nitems: [%s]\n' % secret,
-            'Secret with items': 'kind: Secret\ndata: {password: LEAK1}\nitems: [x]\n',
-            'items without kind': 'items: [%s]\n' % secret,
-            'items in other case': 'kind: ConfigMap\nITEMS: [%s]\n' % secret,
-            'List kind, other case': 'kind: secretlist\nlist: [%s]\n' % secret,
-            'List kind without items': 'kind: SecretList\ndata: {password: LEAK1}\n',
-            'nested lists': 'kind: ConfigMap\ndata: [[%s]]\n' % secret,
-            'nested lists, block': 'kind: Deployment\nspec:\n  x:\n  - - %s\n' % secret,
-        }
-        for name, body in cases.items():
-            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
-            self.assertNotIn('LEAK1', text, name)
-            self.assertNotIn('LEAK2', text, name)
-            self.assertIn('# Source: x', text, name)
-            self.assertIn('# <hidden: ', text, name)
-            self.assertNotIn('kind:', text, name)
-
-    def test_the_manifest_after_a_hidden_document_is_still_shown(self):
-        text = inspect_ops.redact_manifest(
-            '---\nkind: List\nitems: [[LEAK1]]\n---\nkind: ConfigMap\ndata: {a: shown}\n'
-            '---\nkind: Secret\ndata: {a: LEAK2}\n')
-        self.assertNotIn('LEAK', text)
-        self.assertIn('a: shown', text)
-        self.assertIn('a: <hidden>', text)
-
-    def test_plain_documents_pass_as_text_without_being_loaded(self):
-        docs = ['kind: ConfigMap\ndata: {kind: Secret}\n',                  # nested kind is not the kind
-                'kind: Deployment\nspec:\n  kind: Secret\n  containers:\n  - name: a\n    args: [x, y]\n']
-        orig = inspect_ops.yaml.load
-
-        def boom(*a, **k):
-            raise AssertionError('document was loaded')
-        inspect_ops.yaml.load = boom
-        try:
-            for body in docs:
-                text = inspect_ops.redact_manifest('---\n' + body)
-                self.assertEqual(text, '---\n' + body.strip('\n') + '\n')
-        finally:
-            inspect_ops.yaml.load = orig
-
-    def test_documents_that_are_not_plain_mappings_are_hidden(self):
-        # fail closed: only a plain mapping with a string kind is ever shown
-        for body in ('- kind: Secret\n  data: {a: LEAK1}\n', 'LEAK1 as a scalar\n', 'apiVersion: v1\ndata: {a: LEAK1}\n',
-                     'kind: 7\ndata: {a: LEAK1}\n', 'kind: null\ndata: {a: LEAK1}\n', 'kind:\ndata: {a: LEAK1}\n',
-                     'kind: [Secret]\ndata: {a: LEAK1}\n', '1: x\nkind: ConfigMap\ndata: {a: LEAK1}\n',
-                     'kind: ConfigMap\nkind: Secret\ndata: {a: LEAK1}\n',
-                     'Kind: Secret\ndata: {a: LEAK1}\n', 'KIND: Secret\ndata: {a: LEAK1}\n',
-                     '? [a]\n: b\nkind: ConfigMap\ndata: {a: LEAK1}\n'):
-            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
-            self.assertNotIn('LEAK1', text, body)
-            self.assertIn('# Source: x', text, body)
-            self.assertIn('# <hidden: ', text, body)
-
-    def test_secret_document_over_the_load_cap_is_hidden(self):
-        body = 'kind: Secret\ndata:\n  a: LEAK1\n  pad: "%s"\n' % ('x' * inspect_ops.SECRET_DOC_CAP)
-        text = inspect_ops.redact_manifest('---\n# Source: big\n' + body)
-        self.assertNotIn('LEAK1', text)
-        self.assertIn('# Source: big', text)
-        self.assertIn('# <hidden: document too large to redact>', text)
-        small = inspect_ops.redact_manifest('---\nkind: Secret\ndata:\n  a: LEAK1\n')
-        self.assertIn('a: <hidden>', small)
-
     def test_budget_stops_the_redaction(self):
         manifest = ''.join('---\nkind: ConfigMap\nmetadata: {name: n%d}\n' % i for i in range(2000))
         with self.assertRaises(inspect_ops.Failure) as cm:
@@ -806,49 +1043,6 @@ class TestRelease(unittest.TestCase):
             inspect_ops.shape_release(helm_release(manifest), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3,
                                       budget=-1)
         self.assertEqual(cm.exception.code, 'too_large')
-
-    def test_large_non_secret_documents_stay_within_memory_and_time(self):
-        # A 4 MiB document of tiny items, sent as a few KiB of gzip, must not be composed:
-        # measured before the streaming scan: ~700 MiB peak and 4.6 s for the flow variant.
-        probe = textwrap.dedent('''\
-            import resource, sys, time
-            sys.path.insert(0, sys.argv[1])
-            import inspect_ops, yaml
-            variant = sys.argv[2]
-            if variant == 'flow':
-                body = 'kind: ConfigMap\\nx: [' + ','.join(['1'] * 900000) + ']\\n'
-            elif variant == 'block':
-                body = 'kind: ConfigMap\\nx:\\n' + '- a\\n' * 500000
-            else:    # many tiny documents
-                body = '---\\n'.join('kind: ConfigMap\\n' for _ in range(100000))
-            manifest = '---\\n' + body
-            assert len(manifest) <= inspect_ops.MANIFEST_CAP, len(manifest)
-            # the cost of just streaming the events: the time bound is relative to it, so a slow
-            # libyaml or a slow machine does not fail the test (the image runs PyYAML 6.0.2 on musl)
-            started = time.monotonic()
-            for chunk in (manifest.split('---\\n') if variant == 'tiny' else [manifest]):
-                for _ in yaml.parse(chunk, Loader=inspect_ops._YAML_LOADER):
-                    pass
-            baseline = time.monotonic() - started
-            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            started = time.monotonic()
-            try:
-                out = inspect_ops.redact_manifest(manifest, time.monotonic() + 30)
-                ok = out.startswith('---\\nkind') or variant == 'tiny'
-            except inspect_ops.Failure as f:
-                ok = f.code == 'too_large'
-            after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            print(ok, (after - before) // 1024, round(time.monotonic() - started, 2), round(baseline, 2))
-        ''')
-        app_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app')
-        for variant in ('flow', 'block', 'tiny'):
-            out = subprocess.run([sys.executable, '-c', probe, app_dir, variant], capture_output=True,
-                                 text=True, timeout=60, check=True).stdout.split()
-            self.assertEqual(out[0], 'True', variant)
-            self.assertLess(int(out[1]), 64, '%s grew by %s MiB' % (variant, out[1]))
-            # relative to streaming the same events once: still catches composing the document
-            self.assertLess(float(out[2]), 8 * float(out[3]) + 1.0,
-                            '%s took %s s, streaming alone %s s' % (variant, out[2], out[3]))
 
     def test_release_must_match_the_request(self):
         rows = [(3, 'deployed')]
