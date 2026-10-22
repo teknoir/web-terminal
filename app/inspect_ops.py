@@ -26,6 +26,7 @@ import binascii
 import collections
 import concurrent.futures
 import hashlib
+import io
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ import shlex
 import secrets
 import shutil
 import signal
+import threading
 import time
 import zlib
 
@@ -49,6 +51,9 @@ WIRE_VERSION = 1
 INSPECT_PATH = '/inspect/v1/op'
 HEALTH_PATH = '/inspect/v1/healthz'
 MAX_BODY = 4096
+# Tornado's connection-level limit sits above MAX_BODY so that a too big body reaches the handler
+# and is answered with the contract's JSON `invalid` (not a bare 400 without a body).
+LISTEN_MAX_BODY = 64 * 1024
 XFCC_HEADER = 'X-Forwarded-Client-Cert'
 USER_HEADER = 'X-Inspect-User'
 REQUEST_ID_HEADER = 'X-Request-Id'
@@ -61,7 +66,7 @@ SLOT_WAIT = 5.0
 MAX_CONCURRENT = 4
 MAX_PER_USER = 2
 MAX_OPS_PER_MIN = 120
-MAX_MASTERS = 16
+MAX_MASTERS = 6
 CONTROL_PERSIST = 60
 SWEEP_INTERVAL = 60
 KUBECTL_TIMEOUT = '15s'
@@ -72,8 +77,18 @@ POD_CAP = 1024 * 1024
 EVENTS_CAP = 2 * 1024 * 1024
 RELEASE_LIST_CAP = 64 * 1024
 RELEASE_SECRET_CAP = 3 * 1024 * 1024
+# Spec 3.4/3.6 said 32 MiB; json.loads of a 32 MiB document of small objects would need several
+# hundred MiB and the container has 256Mi, so the decoded release is capped at 8 MiB.
 RELEASE_JSON_CAP = 8 * 1024 * 1024
 MANIFEST_CAP = 4 * 1024 * 1024
+RELEASE_JSON_CONTAINERS = 400000      # objects plus arrays in the decoded release JSON
+# Only Secret and *List documents are ever built into objects, and only up to this size (a bigger
+# one is replaced by a placeholder instead of being redacted); everything else is scanned as events.
+SECRET_DOC_CAP = 256 * 1024
+# Wall-time budget of one manifest redaction (the thread stops itself at the budget).
+REDACT_BUDGET = 8.0
+# Release shaping jobs that may exist at once (one running plus one waiting).
+MAX_RELEASE_JOBS = 2
 EVENTS_KEEP = 200
 EVENT_MESSAGE_CAP = 1024
 HISTORY_KEEP = 20
@@ -439,6 +454,10 @@ def decode_release(secret_b64):
             raise Failure('device_error', 'The release record on the robot could not be decoded.')
         if len(blob) > RELEASE_JSON_CAP or d.unconsumed_tail:
             raise Failure('too_large', 'The release record is too large to read.')
+    # json.loads needs ~65 bytes per object or array: bound the count (an upper bound, braces inside
+    # strings count too) before building them, or 8 MiB of `{}` would take ~250 MiB.
+    if blob.count(b'{') + blob.count(b'[') > RELEASE_JSON_CONTAINERS:
+        raise Failure('too_large', 'The release record is too complex to read.')
     try:
         rel = json.loads(blob)
     except ValueError:
@@ -494,51 +513,162 @@ def _redact_object(obj):
 
 
 def _split_comments(text):
-    """(leading comment lines, rest) of one manifest document."""
-    lines = text.split('\n')
+    """(leading comment lines, rest) of one manifest document. Walks the text by index so a
+    document of millions of tiny lines is never split into a list."""
     comments = []
-    i = 0
-    while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith('#')):
-        if lines[i].strip():
-            comments.append(lines[i].rstrip())
-        i += 1
-    return comments, '\n'.join(lines[i:])
+    pos = 0
+    n = len(text)
+    while pos < n:
+        nl = text.find('\n', pos)
+        end = n if nl < 0 else nl
+        line = text[pos:end]
+        if line.strip() and not line.lstrip().startswith('#'):
+            break
+        if line.strip():
+            comments.append(line.rstrip())
+        pos = end + 1
+    return comments, text[pos:] if pos < n else ''
 
 
-def redact_manifest(manifest):
-    out = []
-    for chunk in _DOC_SPLIT.split(manifest):
+_SECRET = 'secret'      # the text has a scalar `kind: Secret`
+_MAYBE = 'maybe'        # something that could produce a Secret or a list of them
+
+
+def _check_budget(deadline):
+    if deadline is not None and time.monotonic() > deadline:
+        raise Failure('too_large', 'The rendered manifest is too complex to read.')
+
+
+def _classify_document(body, deadline):
+    """Stream the YAML events of one document (nothing is composed, so memory stays flat) and
+    return _SECRET or _MAYBE when it must be loaded and redacted, None when it can pass as text.
+
+    Sensitive: a top-level `kind` of Secret or ending in List, a `kind` that is not a plain
+    scalar, a merge key or an alias/complex key at the top level (any of them could bring in
+    a kind), and more than one YAML document. A YAML error raises yaml.YAMLError."""
+    depth = 0
+    root_map = False
+    expect_key = True
+    key = None
+    count = 0
+    documents = 0
+    for ev in yaml.parse(body, Loader=_YAML_LOADER):
+        count += 1
+        if not count & 0x3FF:
+            _check_budget(deadline)
+        if isinstance(ev, yaml.DocumentStartEvent):
+            documents += 1
+            if documents > 1:
+                return _MAYBE
+            continue
+        if isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+            depth -= 1
+            if depth == 1:
+                expect_key = not expect_key
+            continue
+        if not isinstance(ev, (yaml.ScalarEvent, yaml.AliasEvent, yaml.MappingStartEvent,
+                               yaml.SequenceStartEvent)):
+            continue                           # stream/document markers
+        is_start = isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent))
+        if depth == 0:
+            if not isinstance(ev, yaml.MappingStartEvent):
+                return None                    # a scalar or sequence document is not a Secret
+            root_map = True
+        elif depth == 1 and root_map:
+            if expect_key:
+                if not isinstance(ev, yaml.ScalarEvent) or ev.value == '<<':
+                    return _MAYBE
+                key = ev.value
+            elif key == 'kind':
+                if not isinstance(ev, yaml.ScalarEvent):
+                    return _MAYBE
+                if ev.value == 'Secret':
+                    return _SECRET
+                if ev.value.endswith('List'):
+                    return _MAYBE
+        if is_start:
+            depth += 1
+        elif depth == 1:
+            expect_key = not expect_key
+    return None
+
+
+def _iter_documents(manifest):
+    """The text between `---` separator lines, one at a time (no list of them is built)."""
+    pos = 0
+    for m in _DOC_SPLIT.finditer(manifest):
+        yield manifest[pos:m.start()]
+        pos = m.end()
+    yield manifest[pos:]
+
+
+def redact_manifest(manifest, deadline=None):
+    out = io.StringIO()
+    written = 0
+
+    def emit(lines):
+        nonlocal written
+        doc = '---\n%s\n' % lines
+        written += len(doc)
+        if written > MANIFEST_CAP:             # characters never outnumber bytes
+            raise Failure('too_large', 'The rendered manifest is too large to read.')
+        out.write(doc)
+
+    for chunk in _iter_documents(manifest):
+        _check_budget(deadline)
         if not chunk.strip():
             continue
         comments, body = _split_comments(chunk)
         if not body.strip():
-            out.append('\n'.join(comments))
+            emit('\n'.join(comments))
+            continue
+        try:
+            mode = _classify_document(body, deadline)
+        except Failure:
+            raise
+        except Exception:
+            emit('\n'.join(comments + ['# <hidden: document could not be parsed>']))
+            continue
+        if not mode:
+            emit(chunk.strip('\n'))
+            continue
+        if len(body) > SECRET_DOC_CAP or len(body.encode('utf-8')) > SECRET_DOC_CAP:
+            emit('\n'.join(comments + ['# <hidden: document too large to redact>']))
             continue
         try:
             obj = yaml.load(body, Loader=_YAML_LOADER)
         except Exception:
-            out.append('\n'.join(comments + ['# <hidden: document could not be parsed>']))
+            emit('\n'.join(comments + ['# <hidden: document could not be parsed>']))
             continue
         if _redact_object(obj):
             dumped = yaml.safe_dump(obj, sort_keys=False, default_flow_style=False, allow_unicode=True)
-            out.append('\n'.join(comments + [dumped.rstrip('\n')]))
+            emit('\n'.join(comments + [dumped.rstrip('\n')]))
+        elif mode == _SECRET:
+            # A scalar `kind: Secret` was in the text but the loaded document is not one (a later
+            # duplicate key won): do not trust the parse, show nothing of it.
+            emit('\n'.join(comments + ['# <hidden: document could not be read as a Secret>']))
         else:
-            out.append(chunk.strip('\n'))
-    text = ''.join('---\n%s\n' % doc for doc in out)
+            emit(chunk.strip('\n'))
+    text = out.getvalue()
     if len(text.encode('utf-8')) > MANIFEST_CAP:
         raise Failure('too_large', 'The rendered manifest is too large to read.')
     return text
 
 
-def shape_release(secret_b64, rows):
-    """Decode, drop everything but the allowed fields, redact. Runs in a thread."""
+def shape_release(secret_b64, rows, name, namespace, revision, budget=REDACT_BUDGET):
+    """Decode, check it is the release asked for, drop everything but the allowed fields,
+    redact. Runs in a thread; `budget` is the wall time it may take."""
+    deadline = time.monotonic() + budget
     kept = decode_release(secret_b64)
+    if (kept['name'], kept['namespace']) != (name, namespace) or not _is_int(kept['version']) \
+            or kept['version'] != revision:
+        raise Failure('device_error', 'The release record on the robot does not match the request.')
     if len(kept['manifest'].encode('utf-8')) > MANIFEST_CAP:     # before any splitting or parsing
         raise Failure('too_large', 'The rendered manifest is too large to read.')
-    manifest = redact_manifest(kept['manifest'])
+    manifest = redact_manifest(kept['manifest'], deadline)
     history = [{'revision': v, 'status': s} for v, s in rows[:HISTORY_KEEP]]
     result = {
-        'name': kept['name'], 'namespace': kept['namespace'], 'revision': kept['version'],
+        'name': name, 'namespace': namespace, 'revision': revision,
         'status': kept['status'], 'chart': kept['chart'], 'chartVersion': kept['chartVersion'],
         'manifest': manifest, 'history': history,
     }
@@ -599,7 +729,7 @@ class UserState:
 class InspectRunner:
     def __init__(self, config, ssh='ssh', base_dir=None, op_timeout=OP_TIMEOUT, master_timeout=MASTER_TIMEOUT,
                  slot_wait=SLOT_WAIT, max_concurrent=MAX_CONCURRENT, max_masters=MAX_MASTERS,
-                 rate_per_min=MAX_OPS_PER_MIN, clock=time.monotonic):
+                 rate_per_min=MAX_OPS_PER_MIN, clock=time.monotonic, redact_budget=REDACT_BUDGET):
         self.config = config
         self.ssh = ssh
         self.base_dir = base_dir or os.path.join(os.environ.get('TMPDIR') or '/tmp', 'inspect')
@@ -609,6 +739,9 @@ class InspectRunner:
         self.max_masters = max_masters
         self.rate_per_min = rate_per_min
         self.clock = clock
+        self.redact_budget = redact_budget
+        self._jobs = 0
+        self._jobs_lock = threading.Lock()
         self.global_sem = asyncio.Semaphore(max_concurrent)
         self.states = collections.OrderedDict()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='inspect')
@@ -814,8 +947,31 @@ class InspectRunner:
             raise Failure('not_found', 'Revision %d of release %s does not exist.'
                           % (req.fields['revision'], req.fields['release']))
         secret, _, _ = await self._kubectl(st, kubectl_argv(req, revision), RELEASE_SECRET_CAP)
-        result = await loop.run_in_executor(self.pool, shape_release, secret.decode('ascii', 'replace'), rows)
+        result = await self._shape_release(loop, secret.decode('ascii', 'replace'), rows,
+                                           req.fields['release'], req.namespace, revision)
         return result, len(secret)
+
+    async def _shape_release(self, loop, secret, rows, name, namespace, revision):
+        """shape_release on the worker thread. The thread stops itself at its time budget, and the
+        jobs are bounded: a job that outlives its op (timeout) still counts until it ends."""
+        with self._jobs_lock:
+            if self._jobs >= MAX_RELEASE_JOBS:
+                raise Failure('busy', 'The inspect pod is still busy with other releases. Try again.',
+                              retry_after=5)
+            self._jobs += 1
+
+        def job():
+            try:
+                return shape_release(secret, rows, name, namespace, revision, budget=self.redact_budget)
+            finally:
+                with self._jobs_lock:
+                    self._jobs -= 1
+        try:
+            return await loop.run_in_executor(self.pool, job)
+        except RuntimeError:                 # executor shut down: the job never ran
+            with self._jobs_lock:
+                self._jobs -= 1
+            raise
 
     # -- housekeeping
 
@@ -1015,12 +1171,12 @@ def make_inspect_app(config, principals, runner=None, **runner_kwargs):
     return app
 
 
-def start_inspect_listener(config, principals, port):
+def start_inspect_listener(config, principals, port, **runner_kwargs):
     """Start the 8091 listener and the sweeper; returns (application, sweeper) or None when disabled."""
     if not principals:
         return None
-    app = make_inspect_app(config, principals)
-    app.listen(port, address='0.0.0.0', max_body_size=MAX_BODY)
+    app = make_inspect_app(config, principals, **runner_kwargs)
+    app.listen(port, address='0.0.0.0', max_body_size=LISTEN_MAX_BODY)
     sweeper = tornado.ioloop.PeriodicCallback(app.settings['inspect_runner'].sweep, 1000 * SWEEP_INTERVAL)
     sweeper.start()
     return app, sweeper

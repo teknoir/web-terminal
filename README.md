@@ -69,4 +69,6 @@ A read-only second listener for the Backstage backend: it reads logs, events, th
 | `INSPECT_PRINCIPALS` | comma list of `cluster.local/ns/<ns>/sa/<sa>`; the last `X-Forwarded-Client-Cert` element must carry one of them. Empty or unset: the listener is not started (kill switch) |
 | `INSPECT_PORT` | listener port, default 8091 |
 
+Limits worth knowing (the container has 256Mi): the decoded release JSON is capped at 8 MiB (the spec said 32 MiB; `json.loads` of small objects multiplies the size by about 30) and at 400000 objects plus arrays; at most 6 ssh masters (each has its own `wg-connect`); release manifests are redacted in constant memory (YAML events decide the kind, only Secret and `*List` documents up to 256 KiB are loaded, others pass as text) within an 8 s budget and at most 2 release jobs at a time. A request body over 4 KiB gets the JSON `invalid` answer up to 64 KiB (the listener's connection limit); above that tornado answers a bare 400.
+
 Code: `app/inspect_ops.py` (not `inspect.py`, which would shadow the standard library module). Tests: `tests/test_inspect.py` (a fake `ssh`, no network).

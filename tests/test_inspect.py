@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -13,7 +14,8 @@ import time
 import unittest
 
 import tornado.web
-from tornado.testing import AsyncHTTPTestCase
+from tornado.httpclient import AsyncHTTPClient
+from tornado.testing import AsyncHTTPTestCase, AsyncTestCase, bind_unused_port, gen_test
 
 import inspect_ops
 import named
@@ -106,9 +108,9 @@ class FakeSSHMixin:
         return [c for c in self.calls() if 'ControlMaster=yes' in c['argv']]
 
 
-def helm_release(manifest, version=3, status='deployed', gz=True, extra=None):
+def helm_release(manifest, version=3, status='deployed', gz=True, extra=None, name='nvr', namespace='teknoir-demo'):
     rel = {
-        'name': 'nvr', 'namespace': 'teknoir-demo', 'version': version,
+        'name': name, 'namespace': namespace, 'version': version,
         'info': {'first_deployed': '2026-10-01T10:00:00Z', 'last_deployed': '2026-10-02T10:00:00Z',
                  'status': status, 'description': 'Install complete', 'notes': 'SECRET NOTE'},
         'chart': {'metadata': {'name': 'nvr', 'version': '0.4.2', 'appVersion': '1.2.0'},
@@ -493,7 +495,7 @@ class TestRelease(unittest.TestCase):
     def test_decode_drops_everything_else(self):
         rows = [(3, 'deployed'), (2, 'superseded'), (1, 'superseded')]
         for gz in (True, False):
-            out = inspect_ops.shape_release(helm_release(MANIFEST, gz=gz), rows)
+            out = inspect_ops.shape_release(helm_release(MANIFEST, gz=gz), rows, 'nvr', 'teknoir-demo', 3)
             self.assertEqual(set(out), {'name', 'namespace', 'revision', 'status', 'chart', 'chartVersion',
                                         'appVersion', 'lastDeployed', 'manifest', 'history'})
             self.assertEqual((out['name'], out['revision'], out['status'], out['chart'], out['chartVersion'],
@@ -506,7 +508,7 @@ class TestRelease(unittest.TestCase):
 
     def test_history_capped_at_20(self):
         rows = [(i, 'superseded') for i in range(30, 0, -1)]
-        self.assertEqual(len(inspect_ops.shape_release(helm_release(MANIFEST), rows)['history']), 20)
+        self.assertEqual(len(inspect_ops.shape_release(helm_release(MANIFEST), rows, 'nvr', 'teknoir-demo', 3)['history']), 20)
 
     def test_gzip_bomb_is_too_large(self):
         bomb = gzip.compress(b'{"manifest": "' + b'a' * (inspect_ops.RELEASE_JSON_CAP + 1000) + b'"}', 1)
@@ -529,11 +531,123 @@ class TestRelease(unittest.TestCase):
         try:
             started = time.monotonic()
             with self.assertRaises(inspect_ops.Failure) as cm:
-                inspect_ops.shape_release(data, [(1, 'deployed')])
+                inspect_ops.shape_release(data, [(3, 'deployed')], 'nvr', 'teknoir-demo', 3)
         finally:
             inspect_ops.redact_manifest = orig
         self.assertEqual(cm.exception.code, 'too_large')
         self.assertLess(time.monotonic() - started, 2)
+
+    def test_sensitive_documents_are_found_without_composing_them(self):
+        cases = {
+            'flow': 'kind: Secret\ndata: {a: LEAK1}\n',
+            'quoted': '"kind": "Secret"\ndata:\n  a: LEAK1\n',
+            'kind last': 'metadata:\n  name: x\ndata:\n  a: LEAK1\nkind: Secret\n',
+            'duplicate kind': 'kind: Secret\ndata:\n  a: LEAK1\nkind: ConfigMap\n',
+            'merge key': 'base: &b {kind: Secret}\n<<: *b\ndata:\n  a: LEAK1\n',
+            'alias key': '&k kind: ignored\n*k : Secret\ndata:\n  a: LEAK1\n',
+            'kind is an alias': 'x: &k Secret\nkind: *k\ndata:\n  a: LEAK1\n',
+            'list': 'kind: SecretList\nitems:\n- kind: Secret\n  data: {a: LEAK1}\n',
+            'second document': 'kind: ConfigMap\n...\n--- !!map\nkind: Secret\ndata: {a: LEAK1}\n',
+        }
+        for name, body in cases.items():
+            text = inspect_ops.redact_manifest('---\n# Source: x\n' + body)
+            self.assertNotIn('LEAK1', text, name)
+            self.assertIn('# Source: x', text, name)
+
+    def test_plain_documents_pass_as_text_without_being_loaded(self):
+        docs = ['kind: ConfigMap\ndata: {kind: Secret}\n',                  # nested kind is not the kind
+                'kind: Deployment\nspec:\n  kind: Secret\n',
+                '- kind: Secret\n  data: {a: visible}\n',                   # a sequence document
+                'just a scalar\n']
+        orig = inspect_ops.yaml.load
+
+        def boom(*a, **k):
+            raise AssertionError('document was loaded')
+        inspect_ops.yaml.load = boom
+        try:
+            for body in docs:
+                text = inspect_ops.redact_manifest('---\n' + body)
+                self.assertEqual(text, '---\n' + body.strip('\n') + '\n')
+        finally:
+            inspect_ops.yaml.load = orig
+
+    def test_secret_document_over_the_load_cap_is_hidden(self):
+        body = 'kind: Secret\ndata:\n  a: LEAK1\n  pad: "%s"\n' % ('x' * inspect_ops.SECRET_DOC_CAP)
+        text = inspect_ops.redact_manifest('---\n# Source: big\n' + body)
+        self.assertNotIn('LEAK1', text)
+        self.assertIn('# Source: big', text)
+        self.assertIn('# <hidden: document too large to redact>', text)
+        small = inspect_ops.redact_manifest('---\nkind: Secret\ndata:\n  a: LEAK1\n')
+        self.assertIn('a: <hidden>', small)
+
+    def test_budget_stops_the_redaction(self):
+        manifest = ''.join('---\nkind: ConfigMap\nmetadata: {name: n%d}\n' % i for i in range(2000))
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops.redact_manifest(manifest, deadline=time.monotonic() - 1)
+        self.assertEqual(cm.exception.code, 'too_large')
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops.shape_release(helm_release(manifest), [(3, 'deployed')], 'nvr', 'teknoir-demo', 3,
+                                      budget=-1)
+        self.assertEqual(cm.exception.code, 'too_large')
+
+    def test_large_non_secret_documents_stay_within_memory_and_time(self):
+        # A 4 MiB document of tiny items, sent as a few KiB of gzip, must not be composed:
+        # measured before the streaming scan: ~700 MiB peak and 4.6 s for the flow variant.
+        probe = textwrap.dedent('''\
+            import resource, sys, time
+            sys.path.insert(0, sys.argv[1])
+            import inspect_ops, yaml
+            variant = sys.argv[2]
+            if variant == 'flow':
+                body = 'kind: ConfigMap\\nx: [' + ','.join(['1'] * 1900000) + ']\\n'
+            elif variant == 'block':
+                body = 'kind: ConfigMap\\nx:\\n' + '- a\\n' * 1000000
+            else:    # many tiny documents
+                body = '---\\n'.join('a: 1\\n' for _ in range(400000))
+            manifest = '---\\n' + body
+            assert len(manifest) <= inspect_ops.MANIFEST_CAP, len(manifest)
+            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            started = time.monotonic()
+            try:
+                out = inspect_ops.redact_manifest(manifest, time.monotonic() + 30)
+                ok = out.startswith('---\\nkind') or variant == 'tiny'
+            except inspect_ops.Failure as f:
+                ok = f.code == 'too_large'
+            after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            print(ok, (after - before) // 1024, round(time.monotonic() - started, 2))
+        ''')
+        app_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app')
+        for variant in ('flow', 'block', 'tiny'):
+            out = subprocess.run([sys.executable, '-c', probe, app_dir, variant], capture_output=True,
+                                 text=True, timeout=60, check=True).stdout.split()
+            self.assertEqual(out[0], 'True', variant)
+            self.assertLess(int(out[1]), 64, '%s grew by %s MiB' % (variant, out[1]))
+            self.assertLess(float(out[2]), 5.0, '%s took %s s' % (variant, out[2]))
+
+    def test_release_must_match_the_request(self):
+        rows = [(3, 'deployed')]
+        ok = inspect_ops.shape_release(helm_release(MANIFEST), rows, 'nvr', 'teknoir-demo', 3)
+        self.assertIs(type(ok['revision']), int)
+        for name, ns, rev in (('other', 'teknoir-demo', 3), ('nvr', 'elsewhere', 3), ('nvr', 'teknoir-demo', 2)):
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                inspect_ops.shape_release(helm_release(MANIFEST), rows, name, ns, rev)
+            self.assertEqual(cm.exception.code, 'device_error', (name, ns, rev))
+        for version in (None, '3', 3.0, True):
+            data = helm_release(MANIFEST, version=version)
+            for rev in (3, 1):
+                with self.assertRaises(inspect_ops.Failure) as cm:
+                    inspect_ops.shape_release(data, rows, 'nvr', 'teknoir-demo', rev)
+                self.assertEqual(cm.exception.code, 'device_error', version)
+
+    def test_object_dense_release_json_is_too_large(self):
+        # 8 MiB of `{}` would need ~250 MiB inside json.loads; refused before it is built
+        rel = '{"name":"nvr","namespace":"teknoir-demo","version":3,"manifest":"","x":[%s]}' % ','.join(
+            ['{}'] * 2000000)
+        self.assertLess(len(rel), inspect_ops.RELEASE_JSON_CAP)
+        data = base64.b64encode(base64.b64encode(gzip.compress(rel.encode()))).decode()
+        with self.assertRaises(inspect_ops.Failure) as cm:
+            inspect_ops.decode_release(data)
+        self.assertEqual(cm.exception.code, 'too_large')
 
     def test_release_json_cap_is_8_mib(self):
         self.assertEqual(inspect_ops.RELEASE_JSON_CAP, 8 * 1024 * 1024)
@@ -737,7 +851,7 @@ class TestEndpoint(InspectHTTPBase):
     def test_release_explicit_revision_and_missing(self):
         self.scenario({'ops': [
             {'match': 'get secrets -l', 'stdout': '1\tsuperseded\n2\tdeployed\n'},
-            {'match': 'sh.helm.release.v1.nvr.v1', 'stdout': helm_release(MANIFEST, version=1, status='superseded')},
+            {'match': 'sh.helm.release.v1.nvr.v1', 'stdout': helm_release(MANIFEST, version=1, status='superseded', namespace='n')},
         ]})
         body = {'v': 1, 'op': 'release', 'namespace': 'n', 'release': 'nvr', 'revision': 1}
         self.assertEqual(self.body_of(self.post(body))['result']['revision'], 1)
@@ -745,6 +859,42 @@ class TestEndpoint(InspectHTTPBase):
         self.scenario({'ops': [{'match': 'get secrets -l', 'stdout': ''}]})
         self.err(self.post(dict(body, revision=1)), 404, 'not_found')
         self.err(self.post({'v': 1, 'op': 'release', 'namespace': 'n', 'release': 'nvr'}), 404, 'not_found')
+
+    def test_release_for_another_record_is_a_device_error(self):
+        # the Secret that comes back names another release than the one asked for
+        self.scenario({'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST, name='other')},
+        ]})
+        self.err(self.post({'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}),
+                 502, 'device_error')
+
+    def test_release_jobs_are_bounded(self):
+        self.scenario({'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+        ]})
+        runner = self.app.settings['inspect_runner']
+        body = {'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}
+        runner._jobs = inspect_ops.MAX_RELEASE_JOBS      # earlier jobs are still running
+        error = self.err(self.post(body), 429, 'busy')
+        self.assertEqual(error['retryAfter'], 5)
+        self.assertEqual(runner._jobs, inspect_ops.MAX_RELEASE_JOBS)
+        runner._jobs = 0
+        self.assertEqual(self.body_of(self.post(body))['result']['revision'], 3)
+        self.assertEqual(runner._jobs, 0)                # the count goes back down when the job ends
+
+    def test_release_op_oversized_body_gets_json_invalid(self):
+        self.err(self.post(None, raw=json.dumps(dict(self.POD, pad='x' * 5000))), 400, 'invalid')
+
+    def test_release_over_the_time_budget_is_too_large(self):
+        self.app.settings['inspect_runner'].redact_budget = -1
+        self.scenario({'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+        ]})
+        self.err(self.post({'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}),
+                 413, 'too_large')
 
     def test_release_too_large(self):
         self.scenario({'ops': [{'match': 'get secrets -l', 'stdout_bytes': inspect_ops.RELEASE_LIST_CAP + 10}]})
@@ -1071,6 +1221,48 @@ class TestLimits(unittest.TestCase, FakeSSHMixin):
             finally:
                 await r.close()
         self.assertEqual(asyncio.run(go()).code, 'timeout')
+
+    def test_max_masters_is_sized_for_the_container(self):
+        self.assertEqual(inspect_ops.MAX_MASTERS, 6)
+
+
+class TestRealListener(FakeSSHMixin, AsyncTestCase):
+    """Through start_inspect_listener: tornado's connection-level limits apply here."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_fake()
+        sock, self.port = bind_unused_port()
+        sock.close()
+        started = inspect_ops.start_inspect_listener(make_config(), [PRINCIPAL], self.port,
+                                                     ssh=self.ssh, base_dir=self.base_dir)
+        self.app, self.sweeper = started
+
+    def tearDown(self):
+        self.sweeper.stop()
+        self.io_loop.run_sync(self.app.settings['inspect_runner'].close)
+        super().tearDown()
+
+    async def post(self, raw):
+        client = AsyncHTTPClient()
+        return await client.fetch(
+            'http://127.0.0.1:%d/inspect/v1/op' % self.port, method='POST', body=raw, raise_error=False,
+            headers={'Content-Type': 'application/json', 'X-Inspect-User': ALICE,
+                     'X-Forwarded-Client-Cert': XFCC_OK})
+
+    @gen_test
+    async def test_body_over_4_kib_gets_the_json_invalid_answer(self):
+        resp = await self.post(json.dumps({'v': 1, 'op': 'pod', 'namespace': 'n', 'pod': 'p',
+                                           'pad': 'x' * 8192}))
+        self.assertEqual(resp.code, 400)
+        self.assertEqual(resp.headers['Content-Type'], 'application/json')
+        self.assertEqual(json.loads(resp.body)['error']['code'], 'invalid')
+
+    @gen_test
+    async def test_normal_request_works(self):
+        self.scenario({'ops': [{'match': 'get pod', 'stdout': json.dumps({'metadata': {'name': 'p'}})}]})
+        resp = await self.post(json.dumps({'v': 1, 'op': 'pod', 'namespace': 'n', 'pod': 'p'}))
+        self.assertEqual(resp.code, 200, resp.body)
 
 
 class TestWiring(unittest.TestCase):
