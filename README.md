@@ -57,7 +57,7 @@ Alternative to the deadend reverse tunnel, used by the per-device ZTNA web termi
 
 `GET /` and `/new` require the `X-Auth-Request-Email` header (set by oauth2-proxy via ext_authz; only the ingress gateway may reach the pod), create a terminal with an unguessable name bound to that email (max 5 live per user) and redirect to it. Only the creator can open `/<name>` or its websocket; unknown names return 404. Each terminal runs `ssh` with a `wg-connect` ProxyCommand, `StrictHostKeyChecking=yes` and a per-terminal known_hosts file in a private temp dir that is removed when the terminal ends.
 
-Tests: `pip install -r requirements-dev.txt && python -m pytest tests`.
+Tests: `pip install -r requirements-dev.txt && scripts/test.sh` (pytest on `tests/`; under a coding agent it prints only the totals and failures, the full log goes to `.test-logs/`).
 
 
 ## Inspect API (wireguard mode, port 8091)
