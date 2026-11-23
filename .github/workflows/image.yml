@@ -1,0 +1,29 @@
+# Generated from charts/ci/files/repos/web-terminal.yaml on 2026-11-23 by plans/cicd/migrate/gen_callers.py
+# Edit freely afterwards; re-running the generator overwrites this file.
+name: image
+
+# Public image: ghcr.io/teknoir/<image>:sha-<8>, plus :<tag> for a v* tag on
+# main, built on a hosted runner.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  image:
+    uses: teknoir/ci-workflows/.github/workflows/image.yml@main
+    with:
+      image: web-terminal
+      visibility: public
+      runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
