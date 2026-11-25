@@ -1,0 +1,11 @@
+#!/bin/sh
+# Stand-in for `k3s kubectl` on the test device: answers the fixed inspect commands and refuses to
+# run as anyone but root, so an answer proves that sudo let the command through.
+[ "$(id -u)" = 0 ] || { echo "error: k3s must run as root" >&2; exit 1; }
+case "$*" in
+  *" get pod "*) printf '{"metadata":{"name":"ran-as-uid-%s"}}\n' "$(id -u)" ;;
+  *" get secrets -l "*) printf '3\tdeployed\n' ;;
+  *" get secret sh.helm.release.v1."*) cat /opt/fake/release.b64 ;;
+  *"create --dry-run=client"*) cat ;;      # the manifest is JSON here: what arrives on stdin is the answer
+  *) echo "error: unexpected command" >&2; exit 1 ;;
+esac
