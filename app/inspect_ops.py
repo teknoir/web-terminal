@@ -4,6 +4,12 @@ The Backstage backend asks this pod for four fixed, read-only operations on the
 robot's device: ``pod``, ``events``, ``logs`` and ``release`` (the installed helm
 release). The pod runs ``sudo -n k3s kubectl`` on the device over the same
 ``wg-connect`` ssh path the web terminal uses, with one ssh ControlMaster per user.
+A device whose login user needs its password for sudo is read only when the backend
+sends that password with the request (``sudoPassword``): it is held in memory for
+that one op and is never stored, logged or put in an argument. It goes to the device
+only after ``sudo -n`` there has asked for a password, as the first stdin line of a
+fixed wrapper (``sudo_password_command``); a device that asks for none is read with
+the same command as ever and never sees it.
 
 Rules, in short (the full wire contract is plans/nextgen/inspect.md section 3):
 
@@ -28,6 +34,7 @@ import binascii
 import collections
 import concurrent.futures
 import hashlib
+import hmac
 import itertools
 import heapq
 import json
@@ -126,6 +133,49 @@ EVENT_MESSAGE_CAP = 1024
 HISTORY_KEEP = 20
 HIDDEN = '<hidden>'
 
+# sudo with the device password (the request field `sudoPassword`, sent by the backend only).
+SUDO_FIELD = 'sudoPassword'
+# UTF-8 bytes. The request body is at most MAX_BODY, and Linux PAM stops at 512.
+SUDO_PASSWORD_MAX = 512
+# Exit codes of the wrapper (sudo_password_command) that kubectl, sudo, the shell and ssh never use.
+SUDO_NO_PASSWORD_RC = 96     # the first stdin line was empty
+SUDO_REJECTED_RC = 97        # the device did not accept the password (PAM's helper, or sudo)
+SUDO_REFUSED_RC = 98         # the password is right (PAM's helper) and sudo still refused the login
+# A password the device rejected is NEVER sent to it again by this process (the pod serves one
+# device, so this is per device): there is no expiry. It is keyed by the password, so a changed one
+# is tried at once; the same one is tried again only by a new pod (the Shell turned off and on).
+#
+# Why so strict: on a device without PAM's password helper (see _SUDO_WRAPPER) a wrong password
+# goes to sudo, and there ONE wrong command is 2 failed logins for pam_faillock, whose
+# defaults lock the account at 3 within 900 s. So the pod may send a wrong password in ONE
+# command, ever: commands that carry the password run one at a time (SUDO_MAX_PARALLEL), and the
+# first rejection ends it (README, "sudo with the device password").
+#
+# An accepted password is trusted for this long: ops that carry it go straight to the wrapper.
+SUDO_OK_TTL = 300.0
+# "sudo on this device asks for a password" (a plain `sudo -n` said so) is believed for this long by
+# ops that carry a password: they skip their own plain run and go to the wrapper. An op without a
+# password always asks sudo, as it always did. Not only to save a round trip: sudo 1.9.9 (Ubuntu
+# 22.04) takes even a refused `sudo -n` to PAM, where pam_faillock counts it as a failed login, so
+# the op with the password must not add a second one to the backend's first call. Longer than the
+# backend's own 5 minutes, so in a steady state the only plain run is that first call.
+SUDO_ASKS_TTL = 480.0
+SUDO_MEMO_MAX = 16
+# Wrapped commands (the only ones that carry the password) that may run at once, in the whole pod.
+# Commands without the wrapper are not counted. Keep it at 1: see above.
+SUDO_MAX_PARALLEL = 1
+# What sudo says, without a terminal, when it needs a password: sudo, and sudo-rs (the default of
+# Ubuntu 25.10 and later). English only: the wrapper sets LC_ALL=C, the plain command is whatever
+# the device's locale makes of it, as it always was.
+SUDO_ASKS = ('sudo: a password is required', 'sudo: interactive authentication is required')
+SUDO_REQUIRED_MESSAGE = 'The device login user cannot run kubectl through sudo.'
+SUDO_REJECTED_MESSAGE = ('sudo on the robot did not accept the device login the platform holds. '
+                         'Use Other ways.')
+SUDO_REFUSED_MESSAGE = ('sudo on the robot refused the device login although its password is right; the login may be '
+                        'locked after failed attempts, or expired. Try again in a while, or use Other ways.')
+SUDO_NOT_KEPT_MESSAGE = ('sudo on the robot accepted the device login but asked again for the next command, '
+                         'so kubectl could not run. Use Other ways.')
+
 # Field rules: the same patterns exist in the backend (TypeScript).
 NAMESPACE_RE = re.compile(r'^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')
 POD_RE = wg_mode._K8S_NAME_RE
@@ -163,22 +213,40 @@ STATUS = {
 }
 
 
+class _SudoPass:
+    """The device password of ONE op: the password, its digest for the runner's memory, and how
+    many commands of the op carried it to the device."""
+    __slots__ = ('password', 'digest', 'sent')
+
+    def __init__(self, password, digest):
+        self.password, self.digest, self.sent = password, digest, 0
+
+    def __repr__(self):
+        return '<_SudoPass>'
+
+
 class Failure(Exception):
     """An answer with an error code of the wire contract."""
 
-    def __init__(self, code, message, retry_after=None):
+    def __init__(self, code, message, retry_after=None, sudo=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.retry_after = retry_after
+        # 'required' (sudo wants a password), 'rejected' (it refused the one sent) or None. The
+        # error body carries it (`error.sudo`), so the backend can tell without reading sentences.
+        self.sudo = sudo
 
 
 # ---------------------------------------------------------------- validation
 
 class Request:
-    def __init__(self, op, fields):
+    def __init__(self, op, fields, sudo_password=None):
         self.op = op
         self.fields = fields
+        # The device password for sudo, or None. Deliberately not in `fields`: nothing that builds
+        # a command, a target or a log line reads it.
+        self.sudo_password = sudo_password
 
     @property
     def namespace(self):
@@ -230,7 +298,7 @@ def parse_request(body):
         raise Failure('invalid', 'Unknown op.')
     spec = OPS[op]
     for key in body:
-        if key not in spec and key not in ('v', 'op'):
+        if key not in spec and key not in ('v', 'op', SUDO_FIELD):
             raise Failure('invalid', 'Unknown field %s.' % _printable(key, 40))
     fields = {}
     for name, (kind, required) in spec.items():
@@ -240,7 +308,22 @@ def parse_request(body):
             continue
         _check_field(name, kind, body[name])
         fields[name] = body[name]
-    return Request(op, fields)
+    return Request(op, fields, _check_sudo_password(body[SUDO_FIELD]) if SUDO_FIELD in body else None)
+
+
+def _check_sudo_password(value):
+    """The device password as sent, or Failure('invalid') with a sentence that never repeats it.
+    It travels as one stdin line, so it cannot hold a newline (or a NUL, which no shell variable
+    can hold); empty is refused too: the backend leaves the field out when it has no password."""
+    ok = isinstance(value, str) and value != '' and '\n' not in value and '\0' not in value
+    if ok:
+        try:
+            ok = len(value.encode('utf-8')) <= SUDO_PASSWORD_MAX
+        except UnicodeEncodeError:           # a lone surrogate
+            ok = False
+    if not ok:
+        raise Failure('invalid', 'Field %s is not valid.' % SUDO_FIELD)
+    return value
 
 
 def _printable(text, limit):
@@ -297,6 +380,74 @@ def remote_command(argv):
     return ' '.join(shlex.quote(a) for a in argv)
 
 
+# The wrapper of an op that carries the device password. The caller writes the password as the
+# FIRST stdin line; whatever follows (the release manifest) is the stdin of kubectl. The pod uses
+# it only after the plain `sudo -n` said that sudo asks for a password (InspectRunner._dispatch_sudo).
+#
+# * `read` takes exactly that one line, so the payload never meets sudo's password reader and the
+#   password never reaches kubectl. Nothing else in the wrapper reads its stdin before kubectl:
+#   not a sudo either, which with `Defaults log_input` copies its stdin for the log and would take
+#   the manifest that waits there (seen with sudo 1.9.16 and a `sudo -n true` probe: nothing was
+#   left of 2000 lines).
+# * Before sudo sees the password, PAM's own helper checks it (`unix_chkpwd <user> nullok`, the
+#   password and a NUL on its stdin: what pam_unix runs for a process that is not root). It answers
+#   7 (PAM_AUTH_ERR) for a wrong password of a local account, and then sudo is never asked. This is
+#   not a shortcut around sudo: a wrong password given to `sudo -S -v` is one line in sudo's log but
+#   2 failed logins for pam_faillock (sudo 1.8.21 to 1.9.17: it asks PAM again when its input has
+#   ended, and that is counted too; 1 with sudo-rs 0.2.13), and 3 is where faillock's defaults
+#   lock the account. The helper counts nothing and writes its own line to the auth log.
+#   It is trusted only for an account in /etc/passwd; without a helper or a local account the
+#   decision is sudo's, as before.
+# * `sudo -S -v` then gets the line and EOF (it reads it only if it needs a password), and its
+#   messages go to /dev/null. If it refuses a password the helper found right, the login is locked
+#   or expired, not wrong: its own exit code, which is not remembered as a rejection.
+# * There is no `sudo -n true` first to see whether a password is needed: `sudo -S -v` decides
+#   that itself, and with sudo 1.9.9 every refused `sudo -n` is a failed login for pam_faillock.
+# * `printf` is the shell builtin, so the password is in no process's arguments.
+# * kubectl then runs under `sudo -n`, on the login `-v` just stored. sudo keys that login on the
+#   PARENT process when there is no terminal, so the last sudo must be a child of this same shell:
+#   it is followed by `exit $?` on purpose. With `exec sudo -n ...`, or as the last command (bash,
+#   dash and zsh exec the last command of `-c`), sudo's parent is sshd and it answers
+#   "a password is required" (seen with sudo 1.8.21 to 1.9.16; tests/test_sudo_real.py).
+# * Every sudo runs under LC_ALL=C, so what it says is what SUDO_ASKS knows.
+# * It runs under `sh -c`, so the login shell of the device user (bash, zsh, ...) plays no part.
+_SUDO_WRAPPER = ('IFS= read -r p; [ -n "$p" ] || exit %(none)d; '
+                 'u=$(id -un); l=; while IFS=: read -r n x; do [ "$n" = "$u" ] && l=1; done </etc/passwd; '
+                 'k=; for c in /usr/sbin/unix_chkpwd /sbin/unix_chkpwd; do '
+                 '[ -n "$l" ] && [ -x "$c" ] || continue; '
+                 "printf '%%s\\0' \"$p\" | \"$c\" \"$u\" nullok >/dev/null 2>&1; k=$?; break; done; "
+                 '[ "$k" != 7 ] || exit %(rejected)d; '
+                 "printf '%%s\\n' \"$p\" | LC_ALL=C sudo -S -p '' -v 2>/dev/null || "
+                 '{ [ "$k" != 0 ] || exit %(refused)d; exit %(rejected)d; }; '
+                 'unset p; LC_ALL=C %(command)s; exit $?')
+
+
+def sudo_password_command(argv):
+    """The remote command for `argv` (which starts with `sudo -n`) when the op has the device
+    password: the fixed wrapper above around the same argv. The password is not in it."""
+    script = _SUDO_WRAPPER % {'none': SUDO_NO_PASSWORD_RC, 'rejected': SUDO_REJECTED_RC,
+                              'refused': SUDO_REFUSED_RC, 'command': remote_command(argv)}
+    return 'sh -c ' + shlex.quote(script)
+
+
+def sudo_failure(stderr, rc, wrapped=False):
+    """The Failure when sudo, not kubectl, stopped the command; None otherwise. `wrapped`: the
+    command was sudo_password_command, whose exit codes say what happened. Fixed sentences only."""
+    if wrapped and rc == SUDO_REJECTED_RC:
+        return Failure('device_error', SUDO_REJECTED_MESSAGE, sudo='rejected')
+    if wrapped and rc == SUDO_NO_PASSWORD_RC:
+        return Failure('device_error', SUDO_REQUIRED_MESSAGE, sudo='required')
+    if wrapped and rc == SUDO_REFUSED_RC:
+        return Failure('device_error', SUDO_REFUSED_MESSAGE)
+    if any((needle.encode() if isinstance(stderr, bytes) else needle) in stderr for needle in SUDO_ASKS):
+        if wrapped:
+            # `sudo -v` passed and the next sudo still asked: the device keeps no sudo login between
+            # commands (timestamp_timeout=0).
+            return Failure('device_error', SUDO_NOT_KEPT_MESSAGE)
+        return Failure('device_error', SUDO_REQUIRED_MESSAGE, sudo='required')
+    return None
+
+
 # ------------------------------------------------------------- stderr mapping
 
 # The detail is at most 300 characters on one line: an unbounded `(.*?)` is tried from every
@@ -322,9 +473,10 @@ def _first_line(text, limit=300):
     return ''
 
 
-def classify_failure(stderr, rc, connection=False):
+def classify_failure(stderr, rc, connection=False, wrapped=False):
     """Map ssh/kubectl stderr to a Failure. `connection`: the command was ssh itself
-    (master start), so every nonzero exit is a connection problem."""
+    (master start), so every nonzero exit is a connection problem. `wrapped`: the command was
+    sudo_password_command."""
     text = stderr.decode('utf-8', 'replace') if isinstance(stderr, bytes) else stderr
     connection_level = connection or rc == 255
     if connection_level:
@@ -346,27 +498,29 @@ def classify_failure(stderr, rc, connection=False):
             line = _first_line(text)
             return Failure('unavailable', 'Could not open an ssh session to the robot.'
                            + (' ' + line if line else ''))
+    if wrapped and rc in (SUDO_NO_PASSWORD_RC, SUDO_REJECTED_RC, SUDO_REFUSED_RC):
+        return sudo_failure(text, rc, wrapped)      # the wrapper ended before kubectl ran
     if 'previous terminated container' in text:
         return Failure('no_previous', 'The container has no previous run to read.')
     if re.search(r'is waiting to start|ContainerCreating|PodInitializing', text):
         return Failure('not_started', 'The container has not started yet.')
-    if 'sudo: a password is required' in text:
-        return Failure('device_error', 'The device login user cannot run kubectl through sudo.')
+    sudo = sudo_failure(text, rc, wrapped)
+    if sudo:
+        return sudo
     if re.search(r'\(NotFound\)|"[^"\n]*" not found', text, re.M):
         return Failure('not_found', 'Not found on the robot.')
     return Failure('device_error', _first_line(text) or 'kubectl failed (exit %s).' % rc)
 
 
-def manifest_failure(stderr, rc):
+def manifest_failure(stderr, rc, wrapped=False):
     """The Failure for a manifest command that ended at the ssh level (exit 255) or at sudo. Only the
-    hub's `access denied:` line and the sudo prompt are recognised; anything else gets a fixed
-    sentence, because stderr of that command may be kubectl's, which quotes document values."""
+    hub's `access denied:` line, the sudo prompt and the wrapper's exit codes are recognised; anything
+    else gets a fixed sentence, because stderr of that command may be kubectl's, which quotes document
+    values."""
     text = stderr.decode('utf-8', 'replace') if isinstance(stderr, bytes) else stderr
     if rc == 255 and _DENIED_RE.search(text):
         return classify_failure(text, rc)
-    if 'sudo: a password is required' in text:
-        return Failure('device_error', 'The device login user cannot run kubectl through sudo.')
-    return Failure('unavailable', 'The ssh session to the robot ended.')
+    return sudo_failure(text, rc, wrapped) or Failure('unavailable', 'The ssh session to the robot ended.')
 
 
 # --------------------------------------------------------------- result shaping
@@ -997,6 +1151,12 @@ class InspectRunner:
         self._jobs = 0                       # release jobs queued or running
         self._light_jobs = 0                 # pod and events jobs queued or running
         self._jobs_lock = threading.Lock()
+        # What sudo on the device said about a password, keyed by an HMAC of it under a key that
+        # exists only in this process: digest -> ('ok', expiry on self.clock) | ('rejected', None).
+        self._sudo_key = secrets.token_bytes(32)
+        self._sudo_memo = collections.OrderedDict()
+        self._sudo_sem = asyncio.Semaphore(SUDO_MAX_PARALLEL)
+        self._sudo_asked = None              # when the plain `sudo -n` last said that sudo asks
         self.global_sem = asyncio.Semaphore(max_concurrent)
         self.states = collections.OrderedDict()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='inspect')
@@ -1140,37 +1300,161 @@ class InspectRunner:
             if rc != 0:
                 raise classify_failure(err, rc, connection=True)
 
-    async def _remote(self, st, argv, max_out, stdin_data=None):
-        full = self._base_args(st) + ['-o', 'ControlMaster=no', self.config.destination, '--',
-                                      remote_command(argv)]
-        rc, out, err, over = await self._run(full, max_out=max_out, timeout=self.op_timeout,
-                                             stdin_data=stdin_data)
+    async def _remote(self, st, argv, max_out, stdin_data=None, sudo=None):
+        """Run `argv` on the device. Without `sudo` (a _SudoPass) this is exactly the command and
+        the stdin it always was. With it the command is the wrapper (sudo_password_command) and the
+        stdin is the password line, then `stdin_data`."""
+        if sudo is None:
+            return await self._ssh_command(st, remote_command(argv), max_out, stdin_data)
+        # One command at a time carries the password (SUDO_MAX_PARALLEL): a page opens several
+        # requests at once, and each would be a failed login if the password is wrong.
+        async with self._sudo_sem:
+            return await self._wrapped(st, argv, max_out, stdin_data, sudo)
+
+    async def _wrapped(self, st, argv, max_out, stdin_data, sudo):
+        if self._sudo_known(sudo.digest) == 'rejected':
+            # Refused, perhaps by a command that ran while this one waited: it is not sent again.
+            raise Failure('device_error', SUDO_REJECTED_MESSAGE, sudo='rejected')
+        sudo.sent += 1
+        rc, out, err, over = await self._ssh_command(
+            st, sudo_password_command(argv), max_out,
+            sudo.password.encode('utf-8') + b'\n' + (stdin_data or b''))
+        # The wrapper prints nothing itself, so any output is kubectl's.
+        if rc == SUDO_REJECTED_RC and not out:
+            self._sudo_remember(sudo.digest, 'rejected')
+        elif out or (rc >= 0 and rc not in (255, SUDO_NO_PASSWORD_RC, SUDO_REJECTED_RC, SUDO_REFUSED_RC)
+                     and not sudo_failure(err, rc, wrapped=True)):
+            # kubectl ran (whatever it answered): sudo took the password, or needed none.
+            self._sudo_remember(sudo.digest, 'ok')
         return rc, out, err, over
 
-    async def _kubectl(self, st, argv, max_out, allow_over=False):
-        rc, out, err, over = await self._remote(st, argv, max_out)
+    async def _ssh_command(self, st, command, max_out, stdin_data):
+        full = self._base_args(st) + ['-o', 'ControlMaster=no', self.config.destination, '--', command]
+        return await self._run(full, max_out=max_out, timeout=self.op_timeout, stdin_data=stdin_data)
+
+    async def _kubectl(self, st, argv, max_out, allow_over=False, sudo=None):
+        rc, out, err, over = await self._remote(st, argv, max_out, sudo=sudo)
         if over and not allow_over:
             raise Failure('too_large', 'The answer from the robot is too large to read.')
         if rc != 0 and not (over and allow_over):
-            raise classify_failure(err, rc)
+            raise classify_failure(err, rc, wrapped=sudo is not None)
         return out, err, over
+
+    # -- sudo with the device password
+
+    def _sudo_digest(self, password):
+        return hmac.new(self._sudo_key, password.encode('utf-8'), hashlib.sha256).digest()
+
+    def _sudo_known(self, digest):
+        """'ok', 'rejected' or None: what sudo on the device made of this password. A rejection
+        stays for the life of the process; 'ok' ends after SUDO_OK_TTL."""
+        entry = self._sudo_memo.get(digest)
+        if entry is None:
+            return None
+        verdict, expiry = entry
+        if expiry is not None and expiry <= self.clock():
+            del self._sudo_memo[digest]
+            return None
+        return verdict
+
+    def _sudo_remember(self, digest, verdict):
+        if verdict == 'ok':
+            if self._sudo_known(digest) is not None:
+                # Still trusted: its time is not extended, so the plain command is tried again
+                # every SUDO_OK_TTL. Rejected: it stays rejected (a command that was already
+                # running when the device changed its password may still report the old answer).
+                return
+            self._sudo_memo[digest] = ('ok', self.clock() + SUDO_OK_TTL)
+        else:
+            self._sudo_memo[digest] = ('rejected', None)
+        self._sudo_memo.move_to_end(digest)
+        while len(self._sudo_memo) > SUDO_MEMO_MAX:
+            # Oldest first, but never a rejection: forgetting one would allow another attempt.
+            victim = next((k for k, (v, _) in self._sudo_memo.items() if v != 'rejected'), None)
+            if victim is None:
+                victim = next(iter(self._sudo_memo))
+            del self._sudo_memo[victim]
+
+    def _sudo_asks(self):
+        """Whether the plain `sudo -n` on the device said, within SUDO_ASKS_TTL, that sudo asks
+        for a password."""
+        return self._sudo_asked is not None and self.clock() - self._sudo_asked < SUDO_ASKS_TTL
+
+    async def _dispatch_plain(self, st, req):
+        """_dispatch as it always ran (`sudo -n`, no wrapper, no stdin), remembering when sudo
+        answers that it asks for a password."""
+        try:
+            result = await self._dispatch(st, req)
+        except Failure as f:
+            if f.sudo == 'required':
+                self._sudo_asked = self.clock()
+            raise
+        self._sudo_asked = None
+        return result
+
+    async def _dispatch_sudo(self, st, req, note):
+        """_dispatch for a request that may carry the device password. `note['sudo']` says for the
+        log what was done with it: `unused` (the device asked for none: it stayed in the pod),
+        `password` (it went to the wrapper) or `rejected` (not sent: the device refused this one).
+
+        The password is used only when sudo on the device asks for one. The op first runs exactly
+        as it runs without a password (`sudo -n`, no wrapper, no stdin): a device with a NOPASSWD
+        rule answers there and nothing else happens. Only sudo's "a password is required" leads to
+        the wrapper. That first run is skipped while its answer is known: sudo asked within
+        SUDO_ASKS_TTL, or this very password was accepted within SUDO_OK_TTL."""
+        if req.sudo_password is None:
+            return await self._dispatch_plain(st, req)
+        sudo = _SudoPass(req.sudo_password, self._sudo_digest(req.sudo_password))
+        note['sudo'] = 'unused'
+        try:
+            asked = self._sudo_asks()
+            if not asked and self._sudo_known(sudo.digest) != 'ok':
+                try:
+                    return await self._dispatch_plain(st, req)
+                except Failure as f:
+                    if f.sudo != 'required':
+                        raise
+                asked = True
+            try:
+                return await self._dispatch(st, req, sudo)
+            except Failure as f:
+                if f.sudo != 'rejected' or asked:
+                    raise
+            # Refused, and the plain run was skipped on the strength of an earlier acceptance:
+            # the device may need no password by now. If it still asks, the refusal stands.
+            try:
+                return await self._dispatch_plain(st, req)
+            except Failure as f:
+                if f.sudo == 'required':
+                    raise Failure('device_error', SUDO_REJECTED_MESSAGE, sudo='rejected')
+                raise
+        except Failure as f:
+            if f.sudo == 'rejected' and not sudo.sent:
+                note['sudo'] = 'rejected'
+            raise
+        finally:
+            if sudo.sent:
+                note['sudo'] = 'password'
+            sudo.password = None
 
     # -- ops
 
-    async def execute(self, email, req):
-        """Run one validated Request for `email`. Returns (result dict, stdout bytes)."""
+    async def execute(self, email, req, note=None):
+        """Run one validated Request for `email`. Returns (result dict, stdout bytes). `note` (a
+        dict) receives `sudo`: what was done with the request's device password, for the log."""
+        note = {} if note is None else note
         try:
-            return await asyncio.wait_for(self._execute(email, req), self.op_timeout)
+            return await asyncio.wait_for(self._execute(email, req, note), self.op_timeout)
         except asyncio.TimeoutError:
             raise Failure('timeout', 'The robot did not answer within %d s.' % self.op_timeout)
 
-    async def _execute(self, email, req):
+    async def _execute(self, email, req, note):
         st = await self._acquire_state(email)
         try:
             self._check_rate(st)
             async with self._slots(st):
                 await self._ensure_master(st)
-                return await self._dispatch(st, req)
+                return await self._dispatch_sudo(st, req, note)
         finally:
             st.active -= 1
 
@@ -1196,19 +1480,21 @@ class InspectRunner:
                 st.sem.release()
         return Slots()
 
-    async def _dispatch(self, st, req):
+    async def _dispatch(self, st, req, sudo=None):
+        """`sudo`: the op's device password (_SudoPass); None runs every command as it always ran."""
         if req.op == 'pod':
-            out, _, _ = await self._kubectl(st, kubectl_argv(req), POD_CAP)
+            out, _, _ = await self._kubectl(st, kubectl_argv(req), POD_CAP, sudo=sudo)
             pod = await self._light_job(shape_pod_json, out)
             return {'pod': pod}, len(out)
         if req.op == 'events':
-            out, _, _ = await self._kubectl(st, kubectl_argv(req), EVENTS_CAP)
+            out, _, _ = await self._kubectl(st, kubectl_argv(req), EVENTS_CAP, sudo=sudo)
             return await self._light_job(shape_events_json, out), len(out)
         if req.op == 'logs':
-            out, err, over = await self._kubectl(st, kubectl_argv(req), LOG_READ_CAP, allow_over=True)
+            out, err, over = await self._kubectl(st, kubectl_argv(req), LOG_READ_CAP, allow_over=True,
+                                                 sudo=sudo)
             return shape_logs(out, err, req, over), len(out)
         # release
-        listing, _, _ = await self._kubectl(st, kubectl_argv(req), RELEASE_LIST_CAP)
+        listing, _, _ = await self._kubectl(st, kubectl_argv(req), RELEASE_LIST_CAP, sudo=sudo)
         rows = parse_release_list(listing)
         if not rows:
             raise Failure('not_found', 'No helm release %s in namespace %s on the robot.'
@@ -1217,7 +1503,8 @@ class InspectRunner:
         if revision is None:
             raise Failure('not_found', 'Revision %d of release %s does not exist.'
                           % (req.fields['revision'], req.fields['release']))
-        secret, _, _ = await self._kubectl(st, kubectl_argv(req, revision), RELEASE_SECRET_CAP)
+        secret, _, _ = await self._kubectl(st, kubectl_argv(req, revision), RELEASE_SECRET_CAP,
+                                           sudo=sudo)
         name, namespace, budget = req.fields['release'], req.namespace, self.redact_budget
         secret_len = len(secret)
         # The text goes to the job in a box the job empties, and `secret` and `text` are dropped
@@ -1230,13 +1517,14 @@ class InspectRunner:
             lambda: decode_checked(box.pop(), name, namespace, revision, budget=budget))
         del box
         if manifest.strip():
+            wrapped = sudo is not None
             rc, out, err, over = await self._remote(st, kubectl_manifest_argv(req), KUBECTL_OUT_CAP,
-                                                    stdin_data=manifest)
+                                                    stdin_data=manifest, sudo=sudo)
             del manifest
             if over:
                 raise Failure('too_large', 'The rendered manifest is too large to read.')
-            if rc == 255 or b'sudo: a password is required' in err:
-                raise manifest_failure(err, rc)
+            if rc == 255 or sudo_failure(err, rc, wrapped):
+                raise manifest_failure(err, rc, wrapped)
         else:
             del manifest
             rc, out, err = 1, b'', b'error: no objects passed to create'
@@ -1396,6 +1684,10 @@ class _JsonHandler(tornado.web.RequestHandler):
         err = {'code': failure.code, 'message': failure.message}
         if failure.retry_after is not None:
             err['retryAfter'] = failure.retry_after
+        if getattr(failure, 'sudo', None) in ('required', 'rejected'):
+            # sudo on the device asked for a password (and none came, or the one that came cannot
+            # be used), or refused the one it got: the backend decides on this, not on the sentence.
+            err['sudo'] = failure.sudo
         self.send_json(STATUS[failure.code], {'v': WIRE_VERSION, 'error': err})
 
     def write_error(self, status_code, **kwargs):
@@ -1449,14 +1741,15 @@ class OpHandler(_JsonHandler):
         started = time.monotonic()
         rid = self.request.headers.get(REQUEST_ID_HEADER, '')
         rid = rid if REQUEST_ID_RE.fullmatch(rid) else '-'
-        info = {'op': '-', 'user': '-', 'ns': '-', 'target': '-'}
+        info = {'op': '-', 'user': '-', 'ns': '-', 'target': '-', 'sudo': '-'}
         nbytes = 0
+        req = None
         try:
             self._check_peer()
             info['user'] = self._user()
             req = parse_request(self._body())
             info.update(op=req.op, ns=req.namespace, target=req.target)
-            result, nbytes = await self.runner.execute(info['user'], req)
+            result, nbytes = await self.runner.execute(info['user'], req, info)
             ms = int((time.monotonic() - started) * 1000)
             self._audit(info, 'ok', ms, nbytes, rid, logging.INFO)
             self.send_json(200, {'v': WIRE_VERSION, 'op': req.op, 'ms': ms, 'result': result})
@@ -1467,12 +1760,18 @@ class OpHandler(_JsonHandler):
             logger.exception('inspect op=%s failed', info['op'])
             self._audit(info, 'internal', int((time.monotonic() - started) * 1000), nbytes, rid, logging.ERROR)
             self.send_error_body(Failure('internal', 'Something went wrong in the inspect pod.'))
+        finally:
+            if req is not None:
+                req.sudo_password = None       # the op is over: nothing keeps the password
 
     @staticmethod
     def _audit(info, result, ms, nbytes, rid, level):
-        # No content, ever: the fields are validated names.
-        logger.log(level, 'inspect op=%s user=%s ns=%s target=%s result=%s ms=%d bytes=%d reqId=%s',
-                   info['op'], info['user'], info['ns'], info['target'], result, ms, nbytes, rid)
+        # No content, ever: the fields are validated names. `sudo` is `-` (no device password came
+        # with the request), `unused` (one came and the device asked for none: it stayed in the pod),
+        # `password` (it went to the wrapper on the device) or `rejected` (it was not sent: the device
+        # has refused this one).
+        logger.log(level, 'inspect op=%s user=%s ns=%s target=%s result=%s ms=%d bytes=%d reqId=%s sudo=%s',
+                   info['op'], info['user'], info['ns'], info['target'], result, ms, nbytes, rid, info['sudo'])
 
 
 def make_inspect_app(config, principals, runner=None, **runner_kwargs):

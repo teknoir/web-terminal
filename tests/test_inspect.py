@@ -3,6 +3,7 @@ import base64
 import gzip
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -38,7 +39,9 @@ FAKE_SSH = textwrap.dedent('''\
     sc = json.load(open(os.path.join(d, 'scenario.json')))
     cp = argv[argv.index('-S') + 1] if '-S' in argv else None
     entry = {'argv': argv, 'pid': os.getpid(), 'cp_existed': bool(cp and os.path.exists(cp))}
-    if argv and ' -f -' in argv[-1] and '-O' not in argv and 'ControlMaster=yes' not in argv:
+    # stdin is recorded for the manifest command and for every command in the sudo wrapper
+    if (argv and (' -f -' in argv[-1] or argv[-1].startswith('sh -c ')) and '-O' not in argv
+            and 'ControlMaster=yes' not in argv):
         import base64
         entry['stdin_b64'] = base64.b64encode(sys.stdin.buffer.read()).decode()
     with open(os.path.join(d, 'calls.jsonl'), 'a') as fh:
@@ -63,6 +66,22 @@ FAKE_SSH = textwrap.dedent('''\
             open(cp, 'w').close()
         finish(m.get('rc', 0), err=m.get('stderr', ''))
     remote = argv[-1]
+    # A device whose sudo wants a password (scenario `sudo`): the wrapper's exit codes, or sudo's
+    # own refusal for a command without the wrapper. Every password sudo is given is counted.
+    sudo = sc.get('sudo')
+    if sudo:
+        if not remote.startswith('sh -c '):
+            finish(1, err=sudo.get('message', 'sudo: a password is required') + '\\n')
+        import base64
+        first = base64.b64decode(entry['stdin_b64']).split(b'\\n', 1)[0].decode()
+        if not first:
+            finish(96)
+        with open(os.path.join(d, 'sudo_attempts'), 'a') as fh:
+            fh.write('x')
+        if sudo.get('sleep'):
+            time.sleep(sudo['sleep'])
+        if first != sudo['password']:
+            finish(97)
     for op in sc.get('ops', []):
         if op['match'] in remote:
             if op.get('sleep'):
@@ -111,6 +130,10 @@ class FakeSSHMixin:
 
     def master_calls(self):
         return [c for c in self.calls() if 'ControlMaster=yes' in c['argv']]
+
+    def sudo_attempts(self):
+        path = os.path.join(self.work, 'sudo_attempts')
+        return os.path.getsize(path) if os.path.exists(path) else 0
 
 
 def helm_release(manifest, version=3, status='deployed', gz=True, extra=None, name='nvr', namespace='teknoir-demo'):
@@ -2271,6 +2294,657 @@ class TestMainApp8080HasNoInspectRoutes(AsyncHTTPTestCase):
         # deadend mode never reaches it: the call sits under `if wireguard:`
         block = src[src.index('inspect_listener = None'):]
         self.assertTrue(block.splitlines()[1].strip().startswith('if wireguard'))
+
+
+# ------------------------------------------------------------ sudo with the device password
+
+PW = 'Corr3ct horse $(id) `x` \'"; å'       # what a device password may look like
+WRAPPER = ('IFS= read -r p; [ -n "$p" ] || exit 96; '
+           'u=$(id -un); l=; while IFS=: read -r n x; do [ "$n" = "$u" ] && l=1; done </etc/passwd; '
+           'k=; for c in /usr/sbin/unix_chkpwd /sbin/unix_chkpwd; do [ -n "$l" ] && [ -x "$c" ] || continue; '
+           'printf \'%s\\0\' "$p" | "$c" "$u" nullok >/dev/null 2>&1; k=$?; break; done; '
+           '[ "$k" != 7 ] || exit 97; '
+           'printf \'%s\\n\' "$p" | LC_ALL=C sudo -S -p \'\' -v 2>/dev/null || '
+           '{ [ "$k" != 0 ] || exit 98; exit 97; }; unset p; LC_ALL=C ')
+
+
+def wrapped(call):
+    return call['argv'][-1].startswith('sh -c ')
+
+
+class TestSudoWrapper(unittest.TestCase):
+    def req(self, **body):
+        return inspect_ops.parse_request(dict({'v': 1}, **body))
+
+    def test_wrapper_golden(self):
+        argv = inspect_ops.kubectl_argv(self.req(op='pod', namespace='teknoir-demo', pod='nvr-1'))
+        command = inspect_ops.sudo_password_command(argv)
+        words = shlex.split(command)
+        self.assertEqual(words[:2], ['sh', '-c'])
+        self.assertEqual(len(words), 3)
+        self.assertEqual(words[2], WRAPPER + 'sudo -n k3s kubectl --request-timeout=15s -n teknoir-demo get pod '
+                         'nvr-1 -o json; exit $?')
+
+    def test_nothing_reads_the_stdin_that_holds_the_manifest_before_kubectl(self):
+        # Whatever reads the wrapper's stdin eats the manifest; only `read` (one line) may. A sudo
+        # would: `Defaults log_input` makes it copy its stdin for the log (README). So the two
+        # that run before kubectl read a pipe from the builtin printf, and there is no third.
+        script = shlex.split(inspect_ops.sudo_password_command(['sudo', '-n', 'k3s', 'kubectl']))[2]
+        before, last = script.rsplit('unset p; ', 1)
+        self.assertEqual(last, 'LC_ALL=C sudo -n k3s kubectl; exit $?')
+        self.assertEqual(re.findall(r'<[^ ;]+', before), ['</etc/passwd'])
+        self.assertEqual(before.count('printf '), 2)
+        self.assertEqual(re.findall(r'" \| (\S+ \S+)', before), ['"$c" "$u"', 'LC_ALL=C sudo'])
+        self.assertEqual(before.count('sudo '), 1)
+        self.assertNotIn('sudo -n', before)
+
+    def test_wrapper_keeps_every_argument_one_word(self):
+        req = self.req(op='release', namespace='n', release='nvr')
+        for argv in (inspect_ops.kubectl_argv(req), inspect_ops.kubectl_argv(req, 7),
+                     inspect_ops.kubectl_manifest_argv(req)):
+            script = shlex.split(inspect_ops.sudo_password_command(argv))[2]
+            self.assertTrue(script.startswith(WRAPPER))
+            body = script[len(WRAPPER):]
+            self.assertTrue(body.endswith('; exit $?'))
+            self.assertEqual(shlex.split(body[:-len('; exit $?')]), argv)
+
+    def test_the_last_sudo_is_not_exec_and_not_the_last_command(self):
+        # sudo keys its login on the parent process without a terminal: see _SUDO_WRAPPER
+        script = shlex.split(inspect_ops.sudo_password_command(['sudo', '-n', 'true']))[2]
+        self.assertNotIn('exec ', script)
+        self.assertTrue(script.endswith('LC_ALL=C sudo -n true; exit $?'))
+
+    def test_every_sudo_of_the_wrapper_speaks_english(self):
+        script = shlex.split(inspect_ops.sudo_password_command(['sudo', '-n', 'k3s', 'kubectl']))[2]
+        self.assertEqual(script.count('sudo '), 2)
+        self.assertEqual(script.count('LC_ALL=C sudo '), 2)
+
+    def test_the_password_is_not_a_field(self):
+        req = self.req(op='pod', namespace='n', pod='p', sudoPassword=PW)
+        self.assertEqual(req.sudo_password, PW)
+        self.assertEqual(req.fields, {'namespace': 'n', 'pod': 'p'})
+        self.assertEqual(req.target, 'n/p')
+        self.assertNotIn(PW, inspect_ops.sudo_password_command(inspect_ops.kubectl_argv(req)))
+        self.assertIsNone(self.req(op='pod', namespace='n', pod='p').sudo_password)
+
+    def test_passwords_that_cannot_be_one_stdin_line_are_refused_without_an_echo(self):
+        for bad in ('', 'a\nb', 'a\n', '\n', 'a\0b', 'x' * 513, 'å' * 257, 5, None, ['a'], {'a': 1}, True,
+                    '\ud800'):
+            with self.assertRaises(inspect_ops.Failure) as cm:
+                self.req(op='pod', namespace='n', pod='p', sudoPassword=bad)
+            self.assertEqual((cm.exception.code, cm.exception.message),
+                             ('invalid', 'Field sudoPassword is not valid.'))
+        self.assertEqual(self.req(op='pod', namespace='n', pod='p', sudoPassword='x' * 512).sudo_password, 'x' * 512)
+        self.assertEqual(self.req(op='pod', namespace='n', pod='p', sudoPassword=' a\tb\r ').sudo_password,
+                         ' a\tb\r ')
+
+    def test_failures_of_the_wrapper_are_fixed_sentences(self):
+        leak = 'Sorry, try again. hunter2 "nvr-1" not found (NotFound)'
+        f = inspect_ops.classify_failure(leak, 97, wrapped=True)
+        self.assertEqual((f.code, f.message, f.sudo), ('device_error', inspect_ops.SUDO_REJECTED_MESSAGE, 'rejected'))
+        f = inspect_ops.classify_failure(leak, 96, wrapped=True)
+        self.assertEqual((f.code, f.message, f.sudo), ('device_error', inspect_ops.SUDO_REQUIRED_MESSAGE, 'required'))
+        # the helper found the password right and sudo still refused: locked or expired, not wrong
+        f = inspect_ops.classify_failure(leak, 98, wrapped=True)
+        self.assertEqual((f.code, f.message, f.sudo), ('device_error', inspect_ops.SUDO_REFUSED_MESSAGE, None))
+        # without the wrapper the same exit codes are kubectl's
+        for rc in (96, 97, 98):
+            f = inspect_ops.classify_failure('error: boom', rc)
+            self.assertEqual((f.code, f.message, f.sudo), ('device_error', 'error: boom', None))
+        # kubectl's own answers through the wrapper are read as before
+        self.assertEqual(inspect_ops.classify_failure('Error from server (NotFound): pods "x" not found', 1,
+                                                      wrapped=True).code, 'not_found')
+        # the ssh level wins over the wrapper's codes
+        self.assertEqual(inspect_ops.classify_failure('access denied: device_offline (x)', 255, wrapped=True).code,
+                         'offline')
+
+    def test_sudo_and_sudo_rs_asking_for_a_password_are_the_same_answer(self):
+        self.assertEqual(inspect_ops.SUDO_REQUIRED_MESSAGE, 'The device login user cannot run kubectl through sudo.')
+        for said in ('sudo: a password is required', 'sudo: interactive authentication is required'):
+            for text in (said, said + '\n', said.encode(), 'x\n' + said + '\n'):
+                f = inspect_ops.classify_failure(text, 1)
+                self.assertEqual((f.code, f.message, f.sudo),
+                                 ('device_error', inspect_ops.SUDO_REQUIRED_MESSAGE, 'required'))
+                f = inspect_ops.manifest_failure(text, 1)
+                self.assertEqual((f.code, f.message, f.sudo),
+                                 ('device_error', inspect_ops.SUDO_REQUIRED_MESSAGE, 'required'))
+                # through the wrapper: the login was accepted and the next sudo asked again
+                # (timestamp_timeout=0)
+                f = inspect_ops.classify_failure(text, 1, wrapped=True)
+                self.assertEqual((f.code, f.message, f.sudo),
+                                 ('device_error', inspect_ops.SUDO_NOT_KEPT_MESSAGE, None))
+        # another language is not recognised: the first line, as ever
+        f = inspect_ops.classify_failure('sudo: ett lösenord krävs', 1)
+        self.assertEqual((f.code, f.message, f.sudo), ('device_error', 'sudo: ett lösenord krävs', None))
+
+    def test_manifest_failure_of_the_wrapper(self):
+        f = inspect_ops.manifest_failure(b'cannot unmarshal hunter2', 97, wrapped=True)
+        self.assertEqual((f.code, f.message, f.sudo), ('device_error', inspect_ops.SUDO_REJECTED_MESSAGE, 'rejected'))
+        f = inspect_ops.manifest_failure(b'', 96, wrapped=True)
+        self.assertEqual((f.code, f.message), ('device_error', inspect_ops.SUDO_REQUIRED_MESSAGE))
+        f = inspect_ops.manifest_failure(b'cannot unmarshal hunter2', 98, wrapped=True)
+        self.assertEqual((f.code, f.message, f.sudo), ('device_error', inspect_ops.SUDO_REFUSED_MESSAGE, None))
+        f = inspect_ops.manifest_failure(b'cannot unmarshal hunter2', 97)
+        self.assertEqual((f.code, f.message), ('unavailable', 'The ssh session to the robot ended.'))
+
+
+class TestSudoPassword(InspectHTTPBase):
+    now = [1000.0]
+    runner_kwargs = {'clock': lambda: TestSudoPassword.now[0]}
+
+    REL = {'v': 1, 'op': 'release', 'namespace': 'teknoir-demo', 'release': 'nvr'}
+    K = 'sudo -n k3s kubectl --request-timeout=15s'
+    PLAIN = K + ' -n teknoir-demo get pod nvr-1 -o json'
+    POD_OUT = '{"metadata":{"name":"nvr-1"}}'
+    POD_OPS = [{'match': 'get pod', 'stdout': POD_OUT}]
+
+    def setUp(self):
+        TestSudoPassword.now[0] = 1000.0
+        super().setUp()
+
+    def runner(self):
+        return self.app.settings['inspect_runner']
+
+    def stdin_of(self, call):
+        return base64.b64decode(call['stdin_b64'])
+
+    def verdicts(self):
+        return [v for v, _ in self.runner()._sudo_memo.values()]
+
+    def assert_no_password(self, *texts, password=PW):
+        for text in texts:
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', 'replace')
+            self.assertNotIn(password, text)
+            self.assertNotIn(json.dumps(password)[1:-1], text)
+            self.assertNotIn(json.dumps(password, ensure_ascii=False)[1:-1], text)
+
+    def test_without_a_password_the_command_and_stdin_are_what_they_were(self):
+        self.scenario({'ops': self.POD_OPS})
+        with self.assertLogs('inspect_ops', level='INFO') as cm:
+            self.assertEqual(self.post(self.POD).code, 200)
+        call, = self.op_calls()
+        self.assertEqual(call['argv'][-2:], ['--', self.PLAIN])
+        self.assertNotIn('stdin_b64', call)
+        self.assertTrue(cm.output[0].endswith(' sudo=-'), cm.output[0])
+        self.assertEqual(self.runner()._sudo_memo, {})
+
+    def test_a_device_that_needs_the_password_answers_as_before_without_one(self):
+        self.scenario({'sudo': {'password': PW}, 'ops': self.POD_OPS})
+        error = self.err(self.post(self.POD), 502, 'device_error')
+        # the sentence is what it was; `sudo` is new: the backend reads it, not the sentence
+        self.assertEqual(error, {'code': 'device_error', 'sudo': 'required',
+                                 'message': 'The device login user cannot run kubectl through sudo.'})
+        self.assertEqual(self.sudo_attempts(), 0)
+
+    def test_an_op_without_a_password_always_asks_sudo_as_it_always_did(self):
+        # nothing is answered from memory: what the device says now is the answer
+        self.scenario({'sudo': {'password': PW}, 'ops': self.POD_OPS})
+        required = {'code': 'device_error', 'sudo': 'required', 'message': inspect_ops.SUDO_REQUIRED_MESSAGE}
+        for _ in range(3):
+            self.assertEqual(self.err(self.post(self.POD), 502, 'device_error'), required)
+        self.assertEqual(self.post(dict(self.POD, sudoPassword=PW)).code, 200)
+        self.assertEqual(self.err(self.post(self.POD), 502, 'device_error'), required)
+        self.assertEqual([wrapped(c) for c in self.op_calls()], [False, False, False, True, False])
+        # the login user gets a NOPASSWD rule: seen at once
+        self.scenario({'ops': self.POD_OPS})
+        self.assertEqual(self.post(self.POD).code, 200)
+        self.assertEqual(len(self.op_calls()), 6)
+        self.assertEqual(self.sudo_attempts(), 1)
+
+    def test_only_sudo_answers_carry_the_sudo_marker(self):
+        self.scenario({'ops': [{'match': 'get pod', 'rc': 1, 'stderr': 'error: the server is not ready'}]})
+        for body in (self.POD, dict(self.POD, sudoPassword=PW)):
+            self.assertNotIn('sudo', self.err(self.post(body), 502, 'device_error'))
+        self.scenario({'sudo': {'password': 'the-real-one'}, 'ops': self.POD_OPS})
+        for _ in range(2):
+            error = self.err(self.post(dict(self.POD, sudoPassword=PW)), 502, 'device_error')
+            self.assertEqual(error, {'code': 'device_error', 'sudo': 'rejected',
+                                     'message': inspect_ops.SUDO_REJECTED_MESSAGE})
+
+    def test_a_device_that_asks_for_no_password_never_sees_it_or_the_wrapper(self):
+        # a NOPASSWD rule (for everything, or for k3s alone): the same commands, the same stdin
+        # and the same slots as a request without the field, whatever the password is
+        self.scenario({'ops': [
+            {'match': 'get pod', 'stdout': self.POD_OUT},
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+            {'match': CREATE, 'stdout': KUBECTL_OK},
+        ]})
+        self.assertEqual(self.post(self.POD).code, 200)
+        self.assertEqual(self.post(self.REL).code, 200)
+        plain = self.op_calls()
+        with self.assertLogs('inspect_ops', level='INFO') as cm:
+            for _ in range(2):
+                for password in (PW, 'another one'):
+                    self.assertEqual(self.post(dict(self.POD, sudoPassword=password)).code, 200)
+                    self.assertEqual(self.post(dict(self.REL, sudoPassword=password)).code, 200)
+        again = self.op_calls()[len(plain):]
+        self.assertEqual(len(again), 4 * len(plain))
+        for i, call in enumerate(again):
+            self.assertEqual(call['argv'], plain[i % len(plain)]['argv'])
+            self.assertEqual(call.get('stdin_b64'), plain[i % len(plain)].get('stdin_b64'))
+            self.assertFalse(wrapped(call))
+        self.assertEqual(self.stdin_of(again[3]), MANIFEST.encode())
+        self.assertEqual(self.sudo_attempts(), 0)
+        self.assertEqual(self.runner()._sudo_memo, {})
+        self.assertEqual([line.rsplit(' ', 1)[1] for line in cm.output], ['sudo=unused'] * 8)
+
+    def test_the_password_goes_to_the_wrapper_only_after_sudo_asked_for_one(self):
+        self.scenario({'sudo': {'password': PW}, 'ops': self.POD_OPS})
+        with self.assertLogs(level='DEBUG') as cm:
+            resp = self.post(dict(self.POD, sudoPassword=PW), headers={'X-Request-Id': 'rq-1'})
+        self.assertEqual(resp.code, 200, resp.body)
+        self.assertEqual(self.body_of(resp)['result']['pod']['metadata']['name'], 'nvr-1')
+        probe, call = self.op_calls()
+        # first the command a request without the field runs, with no stdin: sudo asks for a password
+        self.assertEqual(probe['argv'][-2:], ['--', self.PLAIN])
+        self.assertNotIn('stdin_b64', probe)
+        # then the same argv in the wrapper, the password as the first stdin line
+        self.assertEqual(call['argv'][-2:], ['--', 'sh -c ' + shlex.quote(WRAPPER + self.PLAIN + '; exit $?')])
+        self.assertEqual(call['argv'][:-1], probe['argv'][:-1])
+        self.assertEqual(self.stdin_of(call), PW.encode('utf-8') + b'\n')
+        for c in self.calls():
+            self.assert_no_password(*c['argv'])
+        self.assert_no_password(resp.body, '\n'.join(cm.output))
+        audit = [line for line in cm.output if 'inspect op=pod' in line]
+        self.assertEqual(len(audit), 1)
+        self.assertTrue(audit[0].endswith(' reqId=rq-1 sudo=password'), audit[0])
+        self.assertEqual(self.sudo_attempts(), 1)
+        self.assertEqual(len(self.master_calls()), 1)
+
+    def test_sudo_rs_asking_leads_to_the_wrapper_too(self):
+        self.scenario({'sudo': {'password': PW, 'message': 'sudo: interactive authentication is required'},
+                       'ops': self.POD_OPS})
+        error = self.err(self.post(self.POD), 502, 'device_error')
+        self.assertEqual(error['message'], inspect_ops.SUDO_REQUIRED_MESSAGE)
+        # sudo just said that it asks: the op with the password does not ask it again
+        self.assertEqual(self.post(dict(self.POD, sudoPassword=PW)).code, 200)
+        self.assertEqual([wrapped(c) for c in self.op_calls()], [False, True])
+
+    def test_the_plain_run_is_skipped_while_its_answer_is_known(self):
+        self.scenario({'sudo': {'password': PW}, 'ops': self.POD_OPS})
+        body = dict(self.POD, sudoPassword=PW)
+        start = TestSudoPassword.now[0]
+
+        def at(seconds):
+            TestSudoPassword.now[0] = start + seconds
+            before = len(self.op_calls())
+            self.assertEqual(self.post(body).code, 200)
+            return [wrapped(c) for c in self.op_calls()[before:]]
+        self.assertEqual(at(0), [False, True])        # sudo asks; then the wrapper
+        self.assertEqual(at(1), [True])
+        self.assertEqual(at(299), [True])             # this password was accepted less than 300 s ago
+        self.assertEqual(at(479), [True])             # sudo said less than 480 s ago that it asks
+        self.assertEqual(at(481), [True])             # accepted again at 479
+        self.assertEqual(at(790), [False, True])      # neither is known any more
+        # The login user gets a NOPASSWD rule. The wrapper works there too (sudo reads no password
+        # it does not need), and once nothing is known the op is the plain one again.
+        self.scenario({'ops': self.POD_OPS})
+        self.assertEqual(at(800), [True])
+        self.assertEqual(at(790 + 481), [False])
+        self.assertEqual(at(790 + 482), [False])
+        self.assertEqual(self.runner()._sudo_memo, {})
+        self.assertIsNone(self.runner()._sudo_asked)
+
+    def test_a_refusal_after_the_plain_run_was_skipped_gives_the_device_the_plain_run(self):
+        # this password was accepted a moment ago, so the op went straight to the wrapper; there
+        # the device refuses it. It may need no password by now: ask before answering.
+        self.scenario({'sudo': {'password': PW}, 'ops': self.POD_OPS})
+        body = dict(self.POD, sudoPassword=PW)
+        start = TestSudoPassword.now[0]
+        self.assertEqual(self.post(body).code, 200)
+        TestSudoPassword.now[0] = start + 301
+        self.assertEqual(self.post(body).code, 200)           # accepted again: trusted until 601
+        TestSudoPassword.now[0] = start + 500                 # what sudo said at 0 is not known any more
+        # the password was changed on the device, and kubectl needs none there now
+        self.scenario({'ops': [{'match': 'unset p', 'rc': 97}, {'match': 'get pod', 'stdout': self.POD_OUT}]})
+        before = len(self.op_calls())
+        with self.assertLogs('inspect_ops', level='INFO') as cm:
+            self.assertEqual(self.post(body).code, 200)
+        self.assertEqual([wrapped(c) for c in self.op_calls()[before:]], [True, False])
+        self.assertTrue(cm.output[0].endswith(' sudo=password'), cm.output[0])
+        self.assertEqual(self.verdicts(), ['rejected'])
+        # afterwards: the plain run first, as for any password that is not known good
+        before = len(self.op_calls())
+        self.assertEqual(self.post(body).code, 200)
+        self.assertEqual([wrapped(c) for c in self.op_calls()[before:]], [False])
+
+    def test_a_refusal_after_the_plain_run_was_skipped_stands_when_sudo_still_asks(self):
+        self.scenario({'sudo': {'password': PW}, 'ops': self.POD_OPS})
+        body = dict(self.POD, sudoPassword=PW)
+        start = TestSudoPassword.now[0]
+        self.assertEqual(self.post(body).code, 200)
+        TestSudoPassword.now[0] = start + 301
+        self.assertEqual(self.post(body).code, 200)
+        TestSudoPassword.now[0] = start + 500
+        self.scenario({'sudo': {'password': 'changed-on-the-device'}, 'ops': self.POD_OPS})
+        before = len(self.op_calls())
+        error = self.err(self.post(body), 502, 'device_error')
+        self.assertEqual((error['message'], error['sudo']), (inspect_ops.SUDO_REJECTED_MESSAGE, 'rejected'))
+        self.assertEqual([wrapped(c) for c in self.op_calls()[before:]], [True, False])
+        # and now both are known: nothing more reaches the device
+        self.err(self.post(body), 502, 'device_error')
+        self.assertEqual(len(self.op_calls()), before + 2)
+
+    def test_release_sends_the_password_line_then_the_manifest_byte_for_byte(self):
+        odd = MANIFEST + 'x: "a\r\nb å \U0001F600"\r\n--- #c\r\n# $(touch /tmp/x) `id` ; \'"\n'
+        self.scenario({'sudo': {'password': PW}, 'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(odd)},
+            {'match': CREATE, 'stdout': KUBECTL_OK},
+        ]})
+        resp = self.post(dict(self.REL, sudoPassword=PW))
+        self.assertEqual(resp.code, 200, resp.body)
+        probe, listing, read, create = self.op_calls()
+        self.assertFalse(wrapped(probe))
+        self.assertNotIn('stdin_b64', probe)
+        line = PW.encode('utf-8') + b'\n'
+        self.assertEqual(self.stdin_of(listing), line)
+        self.assertEqual(self.stdin_of(read), line)
+        self.assertEqual(self.stdin_of(create), line + odd.encode('utf-8'))
+        script = shlex.split(create['argv'][-1])[2]
+        self.assertEqual(script, WRAPPER + self.K + ' create --dry-run=client --validate=false -o json -f -; exit $?')
+        for c in self.op_calls():
+            self.assert_no_password(*c['argv'])
+            self.assertNotIn('Source: nvr', c['argv'][-1])
+        self.assert_no_password(resp.body)
+        self.assertEqual(len(self.body_of(resp)['result']['objects']), 2)
+
+    def test_a_rejected_password_is_one_attempt_and_is_not_sent_again(self):
+        self.scenario({'sudo': {'password': 'the-real-one'}, 'ops': self.POD_OPS})
+        body = dict(self.POD, sudoPassword=PW)
+        with self.assertLogs(level='DEBUG') as cm:
+            first = self.post(body)
+            second = self.post(body)
+            third = self.post(dict(body, op='logs'))
+        for resp in (first, second, third):
+            error = self.err(resp, 502, 'device_error')
+            self.assertEqual(error['message'], inspect_ops.SUDO_REJECTED_MESSAGE)
+            self.assert_no_password(resp.body)
+            self.assertNotIn('the-real-one', resp.body.decode())
+        self.assertEqual(self.sudo_attempts(), 1)
+        # afterwards nothing reaches the device: sudo asks (known) and this password is refused (known)
+        calls = self.op_calls()
+        self.assertEqual([wrapped(c) for c in calls], [False, True])
+        self.assertEqual(['stdin_b64' in c for c in calls], [False, True])
+        audit = [line for line in cm.output if 'inspect op=' in line]
+        self.assertEqual([line.rsplit(' ', 1)[1] for line in audit],
+                         ['sudo=password', 'sudo=rejected', 'sudo=rejected'])
+        self.assert_no_password('\n'.join(cm.output))
+
+    def test_the_release_stops_at_the_first_rejected_command(self):
+        self.scenario({'sudo': {'password': 'the-real-one'}, 'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+            {'match': CREATE, 'stdout': KUBECTL_OK},
+        ]})
+        error = self.err(self.post(dict(self.REL, sudoPassword=PW)), 502, 'device_error')
+        self.assertEqual(error['message'], inspect_ops.SUDO_REJECTED_MESSAGE)
+        self.assertEqual([wrapped(c) for c in self.op_calls()], [False, True])
+        self.assertEqual(self.sudo_attempts(), 1)
+
+    def test_a_rejection_at_the_manifest_command_is_the_fixed_sentence(self):
+        # the device's password changed between two commands of one release
+        self.scenario({'sudo': {'password': PW}, 'ops': [
+            {'match': 'get secrets -l', 'stdout': '3\tdeployed\n'},
+            {'match': 'sh.helm.release.v1.nvr.v3', 'stdout': helm_release(MANIFEST)},
+            {'match': CREATE, 'rc': 97, 'stderr': 'Sorry, try again. hunter2'},
+        ]})
+        error = self.err(self.post(dict(self.REL, sudoPassword=PW)), 502, 'device_error')
+        self.assertEqual(error['message'], inspect_ops.SUDO_REJECTED_MESSAGE)
+        self.assertEqual(self.verdicts(), ['rejected'])
+
+    def test_a_rejected_password_is_never_tried_again_and_a_changed_one_at_once(self):
+        self.scenario({'sudo': {'password': 'the-real-one'}, 'ops': self.POD_OPS})
+        body = dict(self.POD, sudoPassword=PW)
+        self.err(self.post(body), 502, 'device_error')
+        self.err(self.post(body), 502, 'device_error')
+        self.assertEqual(self.sudo_attempts(), 1)
+        # the platform's password was corrected: another password, tried at once
+        self.assertEqual(self.post(dict(self.POD, sudoPassword='the-real-one')).code, 200)
+        self.assertEqual(self.sudo_attempts(), 2)
+        # the old one stays refused for as long as the pod lives: no time brings another attempt
+        for step in (899, 2, 3600, 30 * 86400):
+            TestSudoPassword.now[0] += step
+            error = self.err(self.post(body), 502, 'device_error')
+            self.assertEqual(error['message'], inspect_ops.SUDO_REJECTED_MESSAGE)
+            self.assertFalse(wrapped(self.op_calls()[-1]))
+        self.assertEqual(self.sudo_attempts(), 2)
+        self.assertIn(('rejected', None), self.runner()._sudo_memo.values())
+        # an answer that says it worked does not undo a rejection
+        runner = self.runner()
+        runner._sudo_remember(runner._sudo_digest(PW), 'ok')
+        self.assertEqual(runner._sudo_known(runner._sudo_digest(PW)), 'rejected')
+
+    def test_a_rejected_password_does_not_block_a_device_that_needs_none(self):
+        self.scenario({'sudo': {'password': 'the-real-one'}, 'ops': self.POD_OPS})
+        self.err(self.post(dict(self.POD, sudoPassword=PW)), 502, 'device_error')
+        self.scenario({'ops': self.POD_OPS})                  # the login user gets a NOPASSWD rule
+        TestSudoPassword.now[0] += inspect_ops.SUDO_ASKS_TTL + 1
+        with self.assertLogs('inspect_ops', level='INFO') as cm:
+            resp = self.post(dict(self.POD, sudoPassword=PW))
+        self.assertEqual(resp.code, 200)
+        self.assertNotIn('stdin_b64', self.op_calls()[-1])
+        self.assertTrue(cm.output[0].endswith(' sudo=unused'), cm.output[0])
+        self.assertEqual(self.sudo_attempts(), 1)
+
+    def test_what_is_remembered_is_a_keyed_digest_never_the_password(self):
+        import hashlib
+        self.scenario({'sudo': {'password': PW}, 'ops': self.POD_OPS})
+        self.assertEqual(self.post(dict(self.POD, sudoPassword=PW)).code, 200)
+        runner = self.runner()
+        (digest, (verdict, expiry)), = runner._sudo_memo.items()
+        self.assertEqual(verdict, 'ok')
+        self.assertEqual(expiry, 1000.0 + inspect_ops.SUDO_OK_TTL)
+        self.assertEqual(len(digest), 32)
+        self.assertNotEqual(digest, hashlib.sha256(PW.encode()).digest())
+        self.assertNotIn(PW.encode(), repr(runner.__dict__).encode())
+        self.assertNotIn(PW, repr(vars(runner.states[ALICE])))
+        other = inspect_ops.InspectRunner(make_config(), ssh=self.ssh, base_dir=self.base_dir + '2')
+        self.assertNotEqual(other._sudo_digest(PW), digest)        # the key is per process
+        self.io_loop.run_sync(other.close)
+
+    def test_any_answer_of_kubectl_counts_as_accepted_and_the_ssh_level_as_nothing(self):
+        body = dict(self.POD, sudoPassword=PW)
+        for stderr, status, code in (('Error from server (NotFound): pods "nvr-1" not found', 404, 'not_found'),
+                                     ('error: the server is not ready', 502, 'device_error')):
+            self.runner()._sudo_memo.clear()
+            self.scenario({'sudo': {'password': PW}, 'ops': [{'match': 'get pod', 'rc': 1, 'stderr': stderr}]})
+            self.err(self.post(body), status, code)
+            self.assertEqual(self.verdicts(), ['ok'])
+        for rc, stderr in ((255, 'access denied: device_offline (x)'), (96, ''), (98, ''),
+                           (1, 'sudo: a password is required')):
+            self.runner()._sudo_memo.clear()
+            self.scenario({'sudo': {'password': PW}, 'ops': [{'match': 'get pod', 'rc': rc, 'stderr': stderr}]})
+            self.assertNotEqual(self.post(body).code, 200)
+            self.assertEqual(self.verdicts(), [])
+        # the device keeps no sudo login between two commands: a fixed sentence, and no rejection
+        error = self.err(self.post(body), 502, 'device_error')
+        self.assertEqual(error, {'code': 'device_error', 'message': inspect_ops.SUDO_NOT_KEPT_MESSAGE})
+        self.assertEqual(self.verdicts(), [])
+        # the login is locked or expired: a fixed sentence, tried again by the next read
+        self.scenario({'sudo': {'password': PW}, 'ops': [{'match': 'get pod', 'rc': 98}]})
+        for _ in range(2):
+            error = self.err(self.post(body), 502, 'device_error')
+            self.assertEqual(error, {'code': 'device_error', 'message': inspect_ops.SUDO_REFUSED_MESSAGE})
+        self.assertEqual(self.verdicts(), [])
+        self.assertTrue(all(wrapped(c) for c in self.op_calls()[-2:]))
+
+    def test_the_memo_is_bounded_and_keeps_rejections(self):
+        runner = self.runner()
+        runner._sudo_remember(b'r', 'rejected')
+        for i in range(inspect_ops.SUDO_MEMO_MAX + 5):
+            runner._sudo_remember(b'ok-%d' % i, 'ok')
+        self.assertEqual(len(runner._sudo_memo), inspect_ops.SUDO_MEMO_MAX)
+        self.assertEqual(runner._sudo_known(b'r'), 'rejected')
+        for i in range(inspect_ops.SUDO_MEMO_MAX + 5):
+            runner._sudo_remember(b'no-%d' % i, 'rejected')
+        self.assertEqual(len(runner._sudo_memo), inspect_ops.SUDO_MEMO_MAX)
+
+    def test_invalid_passwords_reach_no_ssh_and_are_not_echoed(self):
+        self.scenario({'ops': self.POD_OPS})
+        for bad in ('line one\nline-two-SECRET', 'nul\0SECRET', '', 7, 'SECRET' * 100):
+            with self.assertLogs(level='DEBUG') as cm:
+                resp = self.post(dict(self.POD, sudoPassword=bad))
+            error = self.err(resp, 400, 'invalid')
+            self.assertEqual(error['message'], 'Field sudoPassword is not valid.')
+            self.assertNotIn('SECRET', resp.body.decode() + '\n'.join(cm.output))
+        self.assertEqual(self.calls(), [])
+
+    def test_the_handler_drops_the_password_when_the_op_ends(self):
+        self.scenario({'ops': self.POD_OPS})
+        seen = []
+        runner = self.runner()
+        execute = runner.execute
+
+        async def spy(email, req, note=None):
+            seen.append(req)
+            return await execute(email, req, note)
+        runner.execute = spy
+        self.assertEqual(self.post(dict(self.POD, sudoPassword=PW)).code, 200)
+        self.assertIsNone(seen[0].sudo_password)
+
+
+class TestSudoPasswordLimits(unittest.TestCase, FakeSSHMixin):
+    def setUp(self):
+        self.setup_fake()
+        self.now = [1000.0]
+
+    def new_runner(self):
+        return inspect_ops.InspectRunner(make_config(), ssh=self.ssh, base_dir=self.base_dir,
+                                         clock=lambda: self.now[0])
+
+    @staticmethod
+    def req(password=PW):
+        return inspect_ops.parse_request({'v': 1, 'op': 'pod', 'namespace': 'n', 'pod': 'p',
+                                          'sudoPassword': password})
+
+    async def four(self, r, password=PW):
+        return await asyncio.gather(r.execute(ALICE, self.req(password)), r.execute(ALICE, self.req(password)),
+                                    r.execute(BOB, self.req(password)), r.execute(BOB, self.req(password)),
+                                    return_exceptions=True)
+
+    def assert_rejected(self, res):
+        self.assertEqual([(type(x), x.code, x.message) for x in res],
+                         [(inspect_ops.Failure, 'device_error', inspect_ops.SUDO_REJECTED_MESSAGE)] * len(res))
+
+    def test_ops_that_arrive_together_make_one_attempt_with_a_wrong_password(self):
+        self.scenario({'sudo': {'password': 'the-real-one', 'sleep': 0.5},
+                       'ops': [{'match': 'get pod', 'stdout': '{"metadata":{}}'}]})
+
+        async def go():
+            r = self.new_runner()
+            res = await self.four(r)
+            await r.close()
+            return res
+        self.assert_rejected(asyncio.run(go()))
+        self.assertEqual(self.sudo_attempts(), 1)
+        # the ops asked with the plain command first (those that started before sudo's answer was
+        # known); one of them carried the password
+        kinds = [wrapped(c) for c in self.op_calls()]
+        self.assertEqual(kinds.count(True), 1)
+        self.assertIn(kinds.count(False), (1, 2, 3, 4))
+
+    def test_one_command_at_a_time_carries_the_password(self):
+        self.scenario({'sudo': {'password': PW, 'sleep': 0.2},
+                       'ops': [{'match': 'get pod', 'stdout': '{"metadata":{}}'}]})
+        live, peak = [0], [0]
+
+        async def go():
+            r = self.new_runner()
+            ssh_command = r._ssh_command
+
+            async def counted(st, command, max_out, stdin_data):
+                if not command.startswith('sh -c '):
+                    return await ssh_command(st, command, max_out, stdin_data)
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                try:
+                    return await ssh_command(st, command, max_out, stdin_data)
+                finally:
+                    live[0] -= 1
+            r._ssh_command = counted
+            first = await self.four(r)                    # nothing is known about the password yet
+            second = await self.four(r)                   # now it is known good
+            await r.close()
+            return first + second
+        res = asyncio.run(go())
+        self.assertTrue(all(isinstance(x, tuple) for x in res), res)
+        self.assertEqual(inspect_ops.SUDO_MAX_PARALLEL, 1)
+        self.assertEqual(peak[0], 1)
+        self.assertEqual(self.sudo_attempts(), 8)
+        # the first four asked with the plain command; the next four went straight to the wrapper
+        self.assertIn(sum(1 for c in self.op_calls() if not wrapped(c)), (1, 2, 3, 4))
+
+    def test_ops_without_the_wrapper_are_not_held_back_by_the_password_limit(self):
+        # a NOPASSWD device: four requests with a password run four plain commands at once
+        self.scenario({'ops': [{'match': 'get pod', 'stdout': '{"metadata":{}}', 'sleep': 0.4}]})
+        live, peak = [0], [0]
+
+        async def go():
+            r = self.new_runner()
+            ssh_command = r._ssh_command
+
+            async def counted(st, command, max_out, stdin_data):
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                try:
+                    return await ssh_command(st, command, max_out, stdin_data)
+                finally:
+                    live[0] -= 1
+            r._ssh_command = counted
+            await r.execute(ALICE, self.req())
+            await r.execute(BOB, self.req())
+            res = await self.four(r)
+            await r.close()
+            return res
+        res = asyncio.run(go())
+        self.assertTrue(all(isinstance(x, tuple) for x in res), res)
+        self.assertEqual(peak[0], inspect_ops.MAX_CONCURRENT)
+        self.assertFalse(any(wrapped(c) for c in self.op_calls()))
+
+    def test_a_password_that_stops_matching_is_sent_in_one_command_and_never_again(self):
+        # The worst the pod can do: an accepted password, pages open, and the password is changed
+        # on the device. One wrong command is two pam_faillock failures (README), and three lock
+        # the account: so ONE command may carry the wrong password, however many are waiting.
+        ops = [{'match': 'get pod', 'stdout': '{"metadata":{}}'}]
+        self.scenario({'sudo': {'password': PW, 'sleep': 0.2}, 'ops': ops})
+        wrong_at = []
+
+        async def go():
+            r = self.new_runner()
+            self.assertTrue(all(isinstance(x, tuple) for x in await self.four(r)))
+            accepted = self.sudo_attempts()
+            self.scenario({'sudo': {'password': 'changed-on-the-device', 'sleep': 0.2}, 'ops': ops})
+            # four requests at once, again and again: 10 s apart, then 15 minutes, a day, a month
+            for step in [10] * 12 + [900, 86400, 30 * 86400]:
+                before = self.sudo_attempts()
+                self.assert_rejected(await self.four(r))
+                wrong_at.extend([self.now[0]] * (self.sudo_attempts() - before))
+                self.now[0] += step
+            await r.close()
+            return accepted
+        accepted = asyncio.run(go())
+        self.assertEqual(accepted, 4)
+        self.assertEqual(wrong_at, [1000.0])                 # one command, in the first moment
+        self.assertEqual(self.sudo_attempts() - accepted, 1)
+
+    def test_a_new_pod_tries_a_rejected_password_once_more(self):
+        # the memory is the process's: this is the one way the same wrong password reaches the
+        # device again (README says so)
+        self.scenario({'sudo': {'password': 'the-real-one'},
+                       'ops': [{'match': 'get pod', 'stdout': '{"metadata":{}}'}]})
+
+        async def pod():
+            r = self.new_runner()
+            res = await self.four(r) + await self.four(r)
+            await r.close()
+            return res
+        self.assert_rejected(asyncio.run(pod()))
+        self.assertEqual(self.sudo_attempts(), 1)
+        self.assert_rejected(asyncio.run(pod()))
+        self.assertEqual(self.sudo_attempts(), 2)
 
 
 if __name__ == '__main__':
