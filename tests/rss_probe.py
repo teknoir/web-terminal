@@ -174,7 +174,7 @@ def release_op(mod, path):
     tracemalloc.start()
     start = tracemalloc.get_traced_memory()[0]
 
-    async def remote(st, argv, max_out, stdin_data=None, password=None):
+    async def remote(st, argv, max_out, stdin_data=None, sudo=None):
         if stdin_data is not None:
             seen['manifest_call'] = (tracemalloc.get_traced_memory()[0] - start) / 1048576.0
             return 0, KUBECTL_ONE_OBJECT, b'', False
